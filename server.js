@@ -9,6 +9,7 @@ import { errorHandler } from "./src/middleware/errorHandler.js";
 import { profileRouter } from "./src/routes/profile.js";
 import { profileImageRouter } from "./src/routes/profileImage.js";
 import { equipmentRouter } from "./src/routes/equipment.js";
+import { equipmentImageRouter } from "./src/routes/equipmentImage.js";
 import { adminRouter } from "./src/routes/admin.js";
 
 const app = express();
@@ -50,6 +51,9 @@ async function startServer() {
     // JSON parser rejects base64 image uploads (~6.6MB for a 5MB image) with 413
     // before the request ever reaches the upload handler.
     app.use("/api/profile/image", profileImageRouter);
+
+    // Mount the equipment image router BEFORE the global express.json() parser for the same reason.
+    app.use("/api/equipment/image", equipmentImageRouter);
 
     app.use(express.json());
 

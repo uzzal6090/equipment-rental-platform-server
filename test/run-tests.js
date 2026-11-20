@@ -27,6 +27,7 @@ const PORT = process.env.PORT || 5001;
 const BASE_URL = `http://localhost:${PORT}`;
 
 const USER_ROLES = ["customer", "owner", "admin"];
+const EQUIPMENT_STATUSES = ["pending", "approved", "rejected"];
 
 // Test results tracking
 const results = [];
@@ -1588,6 +1589,596 @@ const runTests = [
 
     // Cleanup
     await db.collection("profiles").deleteOne({ _id: new ObjectId(userId) });
+  }),
+
+  // ========== ADMIN EQUIPMENT MANAGEMENT TESTS ==========
+  test("Admin can retrieve all equipment across all statuses", async () => {
+    const { status, body } = await fetchJson("/api/admin/equipment", {
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+    });
+
+    assert(status === 200, `Expected 200, got ${status}: ${JSON.stringify(body)}`);
+    assert(body.success === true, "Response should be successful");
+    assert(body.data.equipment, "Should have equipment array");
+    assert(Array.isArray(body.data.equipment), "Equipment should be an array");
+    assert(body.data.equipment.length >= 6, "Should have at least 6 equipment items (including pending, approved, rejected)");
+    assert(body.data.pagination, "Should have pagination");
+  }),
+
+  test("Admin equipment list includes owner information", async () => {
+    const { status, body } = await fetchJson("/api/admin/equipment", {
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+    });
+
+    assert(status === 200);
+    const equipment = body.data.equipment;
+    for (const eq of equipment) {
+      assert(eq.id, "Equipment should have id");
+      assert(eq.name, "Equipment should have name");
+      assert(eq.category, "Equipment should have category");
+      assert(eq.rentalPrice !== undefined, "Equipment should have rentalPrice");
+      assert(eq.rentalType, "Equipment should have rentalType");
+      assert(eq.location, "Equipment should have location");
+      assert(eq.totalQuantity !== undefined, "Equipment should have totalQuantity");
+      assert(eq.status, "Equipment should have status");
+      assert(EQUIPMENT_STATUSES.includes(eq.status), `Equipment status should be valid: ${eq.status}`);
+      assert(eq.owner, "Equipment should have owner information");
+      assert(eq.owner.id, "Owner should have id");
+      assert(eq.owner.name, "Owner should have name");
+      assert(eq.owner.email, "Owner should have email");
+      assert(eq.createdAt, "Equipment should have createdAt");
+      assert(eq.updatedAt, "Equipment should have updatedAt");
+    }
+  }),
+
+  test("Admin equipment list includes all statuses: pending, approved, rejected", async () => {
+    const { status, body } = await fetchJson("/api/admin/equipment", {
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+    });
+
+    assert(status === 200);
+    const equipment = body.data.equipment;
+    const statuses = equipment.map(e => e.status);
+    assert(statuses.includes("approved"), "Should include approved equipment");
+    assert(statuses.includes("pending"), "Should include pending equipment");
+    assert(statuses.includes("rejected"), "Should include rejected equipment");
+  }),
+
+  test("Customer cannot access admin equipment list", async () => {
+    const { status } = await fetchJson("/api/admin/equipment", {
+      headers: { Authorization: `Bearer ${global.__TEST_CUSTOMER_JWT}` },
+    });
+    assert(status === 403, `Expected 403, got ${status}`);
+  }),
+
+  test("Owner cannot access admin equipment list", async () => {
+    const { status } = await fetchJson("/api/admin/equipment", {
+      headers: { Authorization: `Bearer ${global.__TEST_OWNER_JWT}` },
+    });
+    assert(status === 403, `Expected 403, got ${status}`);
+  }),
+
+  test("Unauthenticated request rejected for admin equipment list", async () => {
+    const { status } = await fetchJson("/api/admin/equipment");
+    assert(status === 401, `Expected 401, got ${status}`);
+  }),
+
+  test("Admin can approve pending equipment", async () => {
+    const pendingEquipment = global.__TEST_EQUIPMENT.find(e => e.status === "pending");
+    assert(pendingEquipment, "Should have pending equipment fixture");
+
+    const { status, body } = await fetchJson(`/api/admin/equipment/${pendingEquipment._id}/approve`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+    });
+
+    assert(status === 200, `Expected 200, got ${status}: ${JSON.stringify(body)}`);
+    assert(body.success === true, "Response should be successful");
+    assert(body.data.equipment.status === "approved", "Equipment status should be approved");
+    assert(body.data.equipment.id === pendingEquipment._id.toString(), "Should return same equipment ID");
+  }),
+
+  test("Admin can reject pending equipment", async () => {
+    // Create a fresh pending equipment for this test
+    const newEquipment = {
+      ownerId: ownerProfileId,
+      name: "Equipment to Reject",
+      description: "This equipment will be rejected by admin",
+      category: "Construction Equipment",
+      location: "Reject City",
+      rentalPrice: 100,
+      rentalType: "daily",
+      totalQuantity: 1,
+      condition: "good",
+      status: "pending",
+      featured: false,
+      inventoryVersion: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    const result = await db.collection("equipment").insertOne(newEquipment);
+    const equipmentId = result.insertedId.toString();
+
+    const { status, body } = await fetchJson(`/api/admin/equipment/${equipmentId}/reject`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+    });
+
+    assert(status === 200, `Expected 200, got ${status}: ${JSON.stringify(body)}`);
+    assert(body.success === true, "Response should be successful");
+    assert(body.data.equipment.status === "rejected", "Equipment status should be rejected");
+    assert(body.data.equipment.id === equipmentId, "Should return same equipment ID");
+  }),
+
+  test("Admin cannot approve nonexistent equipment", async () => {
+    const { status, body } = await fetchJson(`/api/admin/equipment/${new ObjectId()}/approve`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+    });
+
+    assert(status === 404, `Expected 404, got ${status}`);
+    assert(body.error.code === "EQUIPMENT_NOT_FOUND", "Should return equipment not found");
+  }),
+
+  test("Admin cannot reject nonexistent equipment", async () => {
+    const { status, body } = await fetchJson(`/api/admin/equipment/${new ObjectId()}/reject`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+    });
+
+    assert(status === 404, `Expected 404, got ${status}`);
+    assert(body.error.code === "EQUIPMENT_NOT_FOUND", "Should return equipment not found");
+  }),
+
+  test("Invalid equipment ID returns 400 for approve", async () => {
+    const { status, body } = await fetchJson("/api/admin/equipment/invalid-id/approve", {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+    });
+
+    assert(status === 400, `Expected 400, got ${status}`);
+    assert(body.error.code === "INVALID_ID", "Should reject invalid ID");
+  }),
+
+  test("Invalid equipment ID returns 400 for reject", async () => {
+    const { status, body } = await fetchJson("/api/admin/equipment/invalid-id/reject", {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+    });
+
+    assert(status === 400, `Expected 400, got ${status}`);
+    assert(body.error.code === "INVALID_ID", "Should reject invalid ID");
+  }),
+
+  test("Approved equipment cannot be approved again", async () => {
+    const approvedEquipment = global.__TEST_EQUIPMENT.find(e => e.status === "approved");
+    assert(approvedEquipment, "Should have approved equipment fixture");
+
+    const { status, body } = await fetchJson(`/api/admin/equipment/${approvedEquipment._id}/approve`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+    });
+
+    assert(status === 400, `Expected 400, got ${status}: ${JSON.stringify(body)}`);
+    assert(body.error.code === "INVALID_STATUS_TRANSITION", "Should reject invalid status transition");
+  }),
+
+  test("Rejected equipment cannot be rejected again", async () => {
+    const rejectedEquipment = global.__TEST_EQUIPMENT.find(e => e.status === "rejected");
+    assert(rejectedEquipment, "Should have rejected equipment fixture");
+
+    const { status, body } = await fetchJson(`/api/admin/equipment/${rejectedEquipment._id}/reject`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+    });
+
+    assert(status === 400, `Expected 400, got ${status}: ${JSON.stringify(body)}`);
+    assert(body.error.code === "INVALID_STATUS_TRANSITION", "Should reject invalid status transition");
+  }),
+
+  test("Admin can update equipment", async () => {
+    const equipment = global.__TEST_EQUIPMENT.find(e => e.ownerId.equals(ownerProfileId));
+    assert(equipment, "Should have test equipment");
+
+    const { status, body } = await fetchJson(`/api/admin/equipment/${equipment._id}`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+      body: JSON.stringify({
+        name: "Admin Updated Equipment Name",
+        rentalPrice: 300,
+        description: "Updated by admin",
+      }),
+    });
+
+    assert(status === 200, `Expected 200, got ${status}: ${JSON.stringify(body)}`);
+    assert(body.success === true, "Response should be successful");
+    const eq = body.data.equipment;
+    assert(eq.name === "Admin Updated Equipment Name", "Should have updated name");
+    assert(eq.rentalPrice === 300, "Should have updated price");
+    assert(eq.id === equipment._id.toString(), "Should have same ID");
+    // Other fields should be preserved
+    assert(eq.category === equipment.category, "Category should be preserved");
+    assert(eq.rentalType === equipment.rentalType, "Rental type should be preserved");
+  }),
+
+  test("Admin can update equipment status directly", async () => {
+    const pendingEquipment = global.__TEST_EQUIPMENT.find(e => e.status === "pending");
+    assert(pendingEquipment, "Should have pending equipment fixture");
+
+    const { status, body } = await fetchJson(`/api/admin/equipment/${pendingEquipment._id}`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+      body: JSON.stringify({
+        status: "approved",
+      }),
+    });
+
+    assert(status === 200, `Expected 200, got ${status}: ${JSON.stringify(body)}`);
+    assert(body.data.equipment.status === "approved", "Equipment status should be approved");
+  }),
+
+  test("Admin update validates fields", async () => {
+    const equipment = global.__TEST_EQUIPMENT.find(e => e.ownerId.equals(ownerProfileId));
+    assert(equipment, "Should have test equipment");
+
+    const { status, body } = await fetchJson(`/api/admin/equipment/${equipment._id}`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+      body: JSON.stringify({
+        rentalPrice: -100,
+        rentalType: "hourly",
+      }),
+    });
+
+    assert(status === 400, `Expected 400, got ${status}`);
+    assert(body.error.code === "VALIDATION_ERROR");
+  }),
+
+  test("Admin cannot set invalid status through update", async () => {
+    const equipment = global.__TEST_EQUIPMENT.find(e => e.ownerId.equals(ownerProfileId));
+    assert(equipment, "Should have test equipment");
+
+    const { status, body } = await fetchJson(`/api/admin/equipment/${equipment._id}`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+      body: JSON.stringify({
+        status: "invalid_status",
+      }),
+    });
+
+    assert(status === 400, `Expected 400, got ${status}`);
+    assert(body.error.code === "VALIDATION_ERROR");
+  }),
+
+  test("Admin update does not allow changing ownerId", async () => {
+    const equipment = global.__TEST_EQUIPMENT.find(e => e.ownerId.equals(ownerProfileId));
+    assert(equipment, "Should have test equipment");
+
+    const { status, body } = await fetchJson(`/api/admin/equipment/${equipment._id}`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+      body: JSON.stringify({
+        ownerId: "some-other-id",
+      }),
+    });
+
+    assert(status === 200, `Expected 200, got ${status}`);
+    // Verify ownerId was not changed
+    const updatedEquipment = await db.collection("equipment").findOne({ _id: equipment._id });
+    assert(updatedEquipment.ownerId.equals(ownerProfileId), "OwnerId should not be changed");
+  }),
+
+  test("Admin can delete equipment", async () => {
+    // Create a new equipment to delete
+    const newEquipment = {
+      ownerId: ownerProfileId,
+      name: "Equipment to Delete by Admin",
+      description: "This equipment will be deleted by admin",
+      category: "Construction Equipment",
+      location: "Delete City",
+      rentalPrice: 100,
+      rentalType: "daily",
+      totalQuantity: 1,
+      condition: "good",
+      status: "pending",
+      featured: false,
+      inventoryVersion: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    const result = await db.collection("equipment").insertOne(newEquipment);
+    const equipmentId = result.insertedId.toString();
+
+    const { status, body } = await fetchJson(`/api/admin/equipment/${equipmentId}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+    });
+
+    assert(status === 200, `Expected 200, got ${status}: ${JSON.stringify(body)}`);
+    assert(body.success === true, "Response should be successful");
+    assert(body.data.deleted === true, "Should confirm deletion");
+    assert(body.data.id === equipmentId, "Should return deleted ID");
+
+    // Verify equipment is actually deleted
+    const deleted = await db.collection("equipment").findOne({ _id: new ObjectId(equipmentId) });
+    assert(deleted === null, "Equipment should be deleted from database");
+  }),
+
+  test("Admin can delete approved equipment", async () => {
+    const approvedEquipment = global.__TEST_EQUIPMENT.find(e => e.status === "approved");
+    assert(approvedEquipment, "Should have approved equipment fixture");
+
+    const { status, body } = await fetchJson(`/api/admin/equipment/${approvedEquipment._id}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+    });
+
+    assert(status === 200, `Expected 200, got ${status}: ${JSON.stringify(body)}`);
+    assert(body.success === true, "Response should be successful");
+    assert(body.data.deleted === true, "Should confirm deletion");
+  }),
+
+  test("Delete nonexistent equipment returns 404", async () => {
+    const { status } = await fetchJson(`/api/admin/equipment/${new ObjectId()}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+    });
+
+    assert(status === 404, `Expected 404, got ${status}`);
+  }),
+
+  test("Delete with invalid ID returns 400", async () => {
+    const { status } = await fetchJson("/api/admin/equipment/invalid-id", {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+    });
+
+    assert(status === 400, `Expected 400, got ${status}`);
+  }),
+
+  test("Customer cannot delete equipment via admin endpoint", async () => {
+    const equipment = global.__TEST_EQUIPMENT.find(e => e.ownerId.equals(ownerProfileId));
+    assert(equipment, "Should have test equipment");
+
+    const { status } = await fetchJson(`/api/admin/equipment/${equipment._id}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${global.__TEST_CUSTOMER_JWT}` },
+    });
+
+    assert(status === 403, `Expected 403, got ${status}`);
+  }),
+
+  test("Owner cannot delete equipment via admin endpoint", async () => {
+    const equipment = global.__TEST_EQUIPMENT.find(e => e.ownerId.equals(ownerProfileId));
+    assert(equipment, "Should have test equipment");
+
+    const { status } = await fetchJson(`/api/admin/equipment/${equipment._id}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${global.__TEST_OWNER_JWT}` },
+    });
+
+    assert(status === 403, `Expected 403, got ${status}`);
+  }),
+
+  test("Unauthenticated delete via admin endpoint rejected", async () => {
+    const equipment = global.__TEST_EQUIPMENT.find(e => e.ownerId.equals(ownerProfileId));
+    assert(equipment, "Should have test equipment");
+
+    const { status } = await fetchJson(`/api/admin/equipment/${equipment._id}`, {
+      method: "DELETE",
+    });
+
+    assert(status === 401, `Expected 401, got ${status}`);
+  }),
+
+  test("Owner cannot approve or reject equipment", async () => {
+    const pendingEquipment = global.__TEST_EQUIPMENT.find(e => e.status === "pending");
+    assert(pendingEquipment, "Should have pending equipment fixture");
+
+    // Try to approve with owner token
+    const { status: approveStatus } = await fetchJson(`/api/admin/equipment/${pendingEquipment._id}/approve`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${global.__TEST_OWNER_JWT}` },
+    });
+
+    assert(approveStatus === 403, `Expected 403, got ${approveStatus}`);
+
+    // Try to reject with owner token
+    const { status: rejectStatus } = await fetchJson(`/api/admin/equipment/${pendingEquipment._id}/reject`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${global.__TEST_OWNER_JWT}` },
+    });
+
+    assert(rejectStatus === 403, `Expected 403, got ${rejectStatus}`);
+  }),
+
+  test("Customer cannot approve or reject equipment", async () => {
+    const pendingEquipment = global.__TEST_EQUIPMENT.find(e => e.status === "pending");
+    assert(pendingEquipment, "Should have pending equipment fixture");
+
+    // Try to approve with customer token
+    const { status: approveStatus } = await fetchJson(`/api/admin/equipment/${pendingEquipment._id}/approve`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${global.__TEST_CUSTOMER_JWT}` },
+    });
+
+    assert(approveStatus === 403, `Expected 403, got ${approveStatus}`);
+
+    // Try to reject with customer token
+    const { status: rejectStatus } = await fetchJson(`/api/admin/equipment/${pendingEquipment._id}/reject`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${global.__TEST_CUSTOMER_JWT}` },
+    });
+
+    assert(rejectStatus === 403, `Expected 403, got ${rejectStatus}`);
+  }),
+
+  test("Public equipment listing still returns approved equipment only", async () => {
+    const { status, body } = await fetchJson("/api/equipment");
+    assert(status === 200, `Expected 200, got ${status}`);
+    assert(body.success === true, "Response should be successful");
+    const equipment = body.data.equipment;
+    assert(Array.isArray(equipment), "Should return equipment array");
+    assert(equipment.length > 0, "Should have approved equipment");
+    for (const item of equipment) {
+      assert(item.status === "approved", `Equipment ${item.id} has status ${item.status}, expected approved`);
+    }
+  }),
+
+  test("Owner equipment list still works and includes all statuses", async () => {
+    const { status, body } = await fetchJson("/api/equipment/owner/me", {
+      headers: { Authorization: `Bearer ${global.__TEST_OWNER_JWT}` },
+    });
+
+    assert(status === 200, `Expected 200, got ${status}: ${JSON.stringify(body)}`);
+    assert(body.success === true, "Response should be successful");
+    assert(body.data.equipment, "Should have equipment array");
+    const statuses = body.data.equipment.map(e => e.status);
+    assert(statuses.includes("approved"), "Should include approved equipment");
+    assert(statuses.includes("pending"), "Should include pending equipment");
+    assert(statuses.includes("rejected"), "Should include rejected equipment");
+  }),
+
+  test("Admin equipment list supports status filter", async () => {
+    const { status, body } = await fetchJson("/api/admin/equipment?status=pending", {
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+    });
+
+    assert(status === 200, `Expected 200, got ${status}`);
+    const equipment = body.data.equipment;
+    assert(equipment.every(e => e.status === "pending"), "All results should have pending status");
+  }),
+
+  test("Admin equipment list supports search", async () => {
+    // Create equipment with a unique searchable name to avoid test pollution
+    const uniqueName = `SearchTest Excavator ${Date.now()}`;
+    const newEquipment = {
+      ownerId: ownerProfileId,
+      name: uniqueName,
+      description: "Equipment for testing search functionality",
+      category: "Construction Equipment",
+      location: "Search City",
+      rentalPrice: 150,
+      rentalType: "daily",
+      totalQuantity: 2,
+      condition: "good",
+      status: "approved",
+      featured: false,
+      inventoryVersion: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    const result = await db.collection("equipment").insertOne(newEquipment);
+    const equipmentId = result.insertedId.toString();
+
+    try {
+      const { status, body } = await fetchJson(`/api/admin/equipment?search=Excavator`, {
+        headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+      });
+
+      assert(status === 200, `Expected 200, got ${status}`);
+      const equipment = body.data.equipment;
+      assert(equipment.length >= 1, "Should find at least one excavator");
+      assert(equipment.every(e => e.name.toLowerCase().includes("excavator")), "All results should match 'Excavator'");
+    } finally {
+      await db.collection("equipment").deleteOne({ _id: new ObjectId(equipmentId) });
+    }
+  }),
+
+  test("Admin equipment list supports category filter", async () => {
+    const { status, body } = await fetchJson("/api/admin/equipment?category=Construction%20Equipment", {
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+    });
+
+    assert(status === 200, `Expected 200, got ${status}`);
+    const equipment = body.data.equipment;
+    assert(equipment.length >= 1, "Should find construction equipment");
+    assert(equipment.every(e => e.category === "Construction Equipment"), "All results should be Construction Equipment");
+  }),
+
+  test("Admin equipment list supports ownerId filter", async () => {
+    const { status, body } = await fetchJson(`/api/admin/equipment?ownerId=${ownerProfileId}`, {
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+    });
+
+    assert(status === 200, `Expected 200, got ${status}`);
+    const equipment = body.data.equipment;
+    assert(equipment.length >= 1, "Should find equipment for owner");
+    for (const eq of equipment) {
+      assert(eq.owner.id === ownerProfileId.toString(), "All results should belong to the specified owner");
+    }
+  }),
+
+  test("Admin equipment list supports pagination", async () => {
+    const { status, body } = await fetchJson("/api/admin/equipment?limit=2&page=1", {
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+    });
+
+    assert(status === 200, `Expected 200, got ${status}`);
+    assert(body.data.pagination.page === 1, "Page should be 1");
+    assert(body.data.pagination.limit === 2, "Limit should be 2");
+    assert(body.data.equipment.length <= 2, "Should not exceed limit");
+  }),
+
+  test("Admin equipment list supports sorting by status", async () => {
+    const { status, body } = await fetchJson("/api/admin/equipment?sort=status_asc", {
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+    });
+
+    assert(status === 200, `Expected 200, got ${status}`);
+    const equipment = body.data.equipment;
+    // Should have statuses in order: approved, pending, rejected (alphabetically)
+    for (let i = 1; i < equipment.length; i++) {
+      const prevStatus = equipment[i - 1].status;
+      const currStatus = equipment[i].status;
+      assert(prevStatus <= currStatus, "Should be sorted by status ascending");
+    }
+  }),
+
+  test("Invalid status filter returns 400", async () => {
+    const { status } = await fetchJson("/api/admin/equipment?status=invalid", {
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+    });
+    assert(status === 400, `Expected 400, got ${status}`);
+  }),
+
+  test("Invalid ownerId filter returns 400", async () => {
+    const { status } = await fetchJson("/api/admin/equipment?ownerId=invalid-id", {
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+    });
+    assert(status === 400, `Expected 400, got ${status}`);
+  }),
+
+  test("Admin equipment delete does not affect owner profile", async () => {
+    const newEquipment = {
+      ownerId: ownerProfileId,
+      name: "Equipment to Delete - Profile Check",
+      description: "Testing profile preservation",
+      category: "Construction Equipment",
+      location: "Profile City",
+      rentalPrice: 100,
+      rentalType: "daily",
+      totalQuantity: 1,
+      condition: "good",
+      status: "pending",
+      featured: false,
+      inventoryVersion: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    const result = await db.collection("equipment").insertOne(newEquipment);
+    const equipmentId = result.insertedId.toString();
+
+    const { status } = await fetchJson(`/api/admin/equipment/${equipmentId}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+    });
+
+    assert(status === 200, `Expected 200, got ${status}`);
+
+    // Verify owner profile still exists
+    const ownerProfile = await db.collection("profiles").findOne({ _id: ownerProfileId });
+    assert(ownerProfile !== null, "Owner profile should still exist");
   }),
 ];
 
