@@ -2,19 +2,25 @@
   "name": "server",
   "version": "1.0.0",
   "description": "",
+  "type": "module",
   "main": "index.js",
+  "exports": "./server.js",
   "scripts": {
     "dev": "nodemon server.js",
-    "start": "node server.js"
+    "start": "node server.js",
+    "bootstrap:admin": "node scripts/bootstrap-admin.js bootstrap",
+    "bootstrap:admin:inspect": "node scripts/bootstrap-admin.js inspect"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
+    "@better-auth/mongo-adapter": "^1.7.25",
+    "better-auth": "^1.7.25",
     "cors": "^2.8.6",
     "dotenv": "^18.0.10",
     "express": "^5.3.0",
+    "jose": "^6.2.17",
     "mongodb": "^7.9.0"
   },
   "devDependencies": {
