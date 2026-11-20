@@ -1,8 +1,11 @@
-const dns = require("dns");
-const { MongoClient } = require("mongodb");
+import * as dns from "dns";
+import { config as dotenvConfig } from "dotenv";
+import { MongoClient } from "mongodb";
+
+dotenvConfig();
 
 const uri = process.env.MONGODB_URI;
-const dbName = "equipment_rental_db";
+const dbName = process.env.DB_NAME || "equipment_rental_db";
 
 let client;
 let db;
@@ -61,6 +64,55 @@ function getDB() {
   return db;
 }
 
+function getClient() {
+  if (!isConnected || !client) {
+    const error = new Error("Database client is not connected");
+    error.code = "DB_NOT_CONNECTED";
+    throw error;
+  }
+  return client;
+}
+
+async function verifyTransactionSupport() {
+  const session = getClient().startSession();
+  try {
+    await session.startTransaction();
+    // Perform a real harmless transactional write and roll it back so nothing
+    // persists. No existing user data is touched.
+    const db = getDB();
+    await db.collection("_transaction_verification").insertOne(
+      { verifiedAt: new Date(), check: true },
+      { session }
+    );
+    await session.abortTransaction();
+    return true;
+  } catch (error) {
+    try {
+      await session.abortTransaction();
+    } catch (_) {
+      // Ignore abort errors; the verification failure takes precedence.
+    }
+    return false;
+  } finally {
+    session.endSession();
+  }
+}
+
+async function withTransaction(fn, options = {}) {
+  const session = getClient().startSession();
+  try {
+    // Use the driver's session.withTransaction() callback API. The driver owns
+    // TransientTransactionError and UnknownTransactionCommitResult retry
+    // semantics. We do not manually start/commit/abort and never blindly rerun
+    // an uncertain commit. Custom inventory-version conflicts propagate out and
+    // are retried by the outer withInventoryGuard() loop using a fresh
+    // transaction.
+    return await session.withTransaction(fn, options);
+  } finally {
+    await session.endSession();
+  }
+}
+
 async function closeDB() {
   if (client) {
     await client.close();
@@ -71,4 +123,4 @@ async function closeDB() {
   }
 }
 
-module.exports = { connectDB, getDB, closeDB };
+export { connectDB, getDB, getClient, closeDB, withTransaction, verifyTransactionSupport };
