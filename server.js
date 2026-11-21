@@ -11,6 +11,8 @@ import { profileImageRouter } from "./src/routes/profileImage.js";
 import { equipmentRouter } from "./src/routes/equipment.js";
 import { equipmentImageRouter } from "./src/routes/equipmentImage.js";
 import { favoritesRouter } from "./src/routes/favorites.js";
+import { rentalsRouter } from "./src/routes/rentals.js";
+import { ownerRentalsRouter } from "./src/routes/ownerRentals.js";
 import { adminRouter } from "./src/routes/admin.js";
 import { ownerRouter } from "./src/routes/owner.js";
 
@@ -64,6 +66,10 @@ app.use("/api/profile", profileRouter);
 app.use("/api/equipment", equipmentRouter);
 
 app.use("/api/favorites", favoritesRouter);
+
+app.use("/api/rentals", rentalsRouter);
+
+app.use("/api/owner/rentals", ownerRentalsRouter);
 
 app.use("/api/admin", adminRouter);
 
