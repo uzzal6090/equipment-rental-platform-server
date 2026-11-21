@@ -255,9 +255,16 @@ async function insertFixtures() {
   const result = await db.collection("equipment").insertMany(equipment);
   console.log(`Inserted ${result.insertedCount} equipment fixtures`);
 
-  // Store inserted IDs for test reference
-  const inserted = await db.collection("equipment").find({}).toArray();
+  // Store inserted IDs for test reference - use the insertMany result to preserve order
+  const insertedIds = Object.values(result.insertedIds);
+  console.log("Inserted IDs:", insertedIds.map(id => id.toString()));
+  const inserted = await db.collection("equipment").find({ _id: { $in: insertedIds } }).toArray();
+  console.log("Found equipment:", inserted.map(e => `${e._id} - ${e.name} - ${e.status}`));
+  // Sort by the original fixture order using the insertedIds array
+  const idToIndex = new Map(insertedIds.map((id, index) => [id.toString(), index]));
+  inserted.sort((a, b) => (idToIndex.get(a._id.toString()) ?? 0) - (idToIndex.get(b._id.toString()) ?? 0));
   global.__TEST_EQUIPMENT = inserted;
+  console.log("Sorted equipment:", global.__TEST_EQUIPMENT.map(e => `${e._id} - ${e.name} - ${e.status}`));
   console.log(`Retrieved ${inserted.length} equipment records from test db`);
 }
 
@@ -410,6 +417,70 @@ async function waitForServer(maxRetries = 30, delayMs = 500) {
 }
 
 // --- Tests ---
+
+// Helper functions for favorites tests (create isolated test equipment)
+async function createApprovedEquipmentForFavorites(db, ownerProfileId) {
+  const equipment = {
+    ownerId: ownerProfileId,
+    name: `Favorites Test Equipment ${Date.now()}${Math.random()}`,
+    description: "Equipment for favorites testing",
+    category: "Construction Equipment",
+    location: "Test City",
+    rentalPrice: 100,
+    rentalType: "daily",
+    totalQuantity: 5,
+    condition: "good",
+    status: "approved",
+    featured: false,
+    inventoryVersion: 0,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  };
+  const result = await db.collection("equipment").insertOne(equipment);
+  return { ...equipment, _id: result.insertedId };
+}
+
+async function createPendingEquipmentForFavorites(db, ownerProfileId) {
+  const equipment = {
+    ownerId: ownerProfileId,
+    name: `Pending Favorites Test Equipment ${Date.now()}${Math.random()}`,
+    description: "Pending equipment for favorites testing",
+    category: "Construction Equipment",
+    location: "Test City",
+    rentalPrice: 100,
+    rentalType: "daily",
+    totalQuantity: 5,
+    condition: "good",
+    status: "pending",
+    featured: false,
+    inventoryVersion: 0,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  };
+  const result = await db.collection("equipment").insertOne(equipment);
+  return { ...equipment, _id: result.insertedId };
+}
+
+async function createRejectedEquipmentForFavorites(db, ownerProfileId) {
+  const equipment = {
+    ownerId: ownerProfileId,
+    name: `Rejected Favorites Test Equipment ${Date.now()}${Math.random()}`,
+    description: "Rejected equipment for favorites testing",
+    category: "Construction Equipment",
+    location: "Test City",
+    rentalPrice: 100,
+    rentalType: "daily",
+    totalQuantity: 5,
+    condition: "good",
+    status: "rejected",
+    featured: false,
+    inventoryVersion: 0,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  };
+  const result = await db.collection("equipment").insertOne(equipment);
+  return { ...equipment, _id: result.insertedId };
+}
 
 const runTests = [
   // ========== EXISTING PUBLIC EQUIPMENT TESTS ==========
@@ -629,6 +700,156 @@ const runTests = [
       { headers: { Authorization: `Bearer ${global.__TEST_OWNER_JWT}` } }
     );
     assert(status === 404, `Expected 404, got ${status}`);
+  }),
+
+  // ========== EQUIPMENT DETAILS ACCESS CONTROL TESTS ==========
+  test("Customer cannot access pending equipment", async () => {
+    // Find pending equipment from test fixtures
+    const pendingEquipment = global.__TEST_EQUIPMENT.find(e => e.status === "pending")
+    assert(pendingEquipment, "Should have pending equipment fixture")
+    
+    const { status } = await fetchJson(
+      `/api/equipment/${pendingEquipment._id}`,
+      { headers: { Authorization: `Bearer ${global.__TEST_CUSTOMER_JWT}` } }
+    );
+    assert(status === 404, `Customer should not access pending equipment, got ${status}`);
+  }),
+
+  test("Customer cannot access rejected equipment", async () => {
+    const rejectedEquipment = global.__TEST_EQUIPMENT.find(e => e.status === "rejected")
+    assert(rejectedEquipment, "Should have rejected equipment fixture")
+    
+    const { status } = await fetchJson(
+      `/api/equipment/${rejectedEquipment._id}`,
+      { headers: { Authorization: `Bearer ${global.__TEST_CUSTOMER_JWT}` } }
+    );
+    assert(status === 404, `Customer should not access rejected equipment, got ${status}`);
+  }),
+
+  test("Customer can access approved equipment", async () => {
+    const approvedEquipment = global.__TEST_EQUIPMENT.find(e => e.status === "approved")
+    assert(approvedEquipment, "Should have approved equipment fixture")
+    
+    const { status, body } = await fetchJson(
+      `/api/equipment/${approvedEquipment._id}`,
+      { headers: { Authorization: `Bearer ${global.__TEST_CUSTOMER_JWT}` } }
+    );
+    assert(status === 200, `Customer should access approved equipment, got ${status}`);
+    assert(body.success === true, "Response should be successful");
+  }),
+
+  test("Owner can access their own pending equipment", async () => {
+    const pendingEquipment = global.__TEST_EQUIPMENT.find(e => e.status === "pending")
+    assert(pendingEquipment, "Should have pending equipment fixture")
+    
+    const { status, body } = await fetchJson(
+      `/api/equipment/${pendingEquipment._id}`,
+      { headers: { Authorization: `Bearer ${global.__TEST_OWNER_JWT}` } }
+    );
+    assert(status === 200, `Owner should access own pending equipment, got ${status}`);
+    assert(body.success === true, "Response should be successful");
+  }),
+
+  test("Owner can access their own rejected equipment", async () => {
+    const rejectedEquipment = global.__TEST_EQUIPMENT.find(e => e.status === "rejected")
+    assert(rejectedEquipment, "Should have rejected equipment fixture")
+    
+    const { status, body } = await fetchJson(
+      `/api/equipment/${rejectedEquipment._id}`,
+      { headers: { Authorization: `Bearer ${global.__TEST_OWNER_JWT}` } }
+    );
+    assert(status === 200, `Owner should access own rejected equipment, got ${status}`);
+    assert(body.success === true, "Response should be successful");
+  }),
+
+  test("Owner cannot access another owner's equipment", async () => {
+    // Create another owner and their equipment
+    const db = mongoClient.db(DB_NAME)
+    const otherOwnerProfile = {
+      betterAuthUserId: "test-other-owner-1",
+      name: "Other Owner",
+      email: "other-owner@example.com",
+      profileImage: null,
+      phone: null,
+      address: null,
+      role: "owner",
+      roleVersion: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }
+    const result = await db.collection("profiles").insertOne(otherOwnerProfile)
+    const otherOwnerId = result.insertedId
+    
+    const otherEquipment = {
+      ownerId: otherOwnerId,
+      name: "Other Owner's Equipment",
+      description: "Equipment belonging to another owner",
+      category: "Construction Equipment",
+      location: "Boston, MA",
+      rentalPrice: 100,
+      rentalType: "daily",
+      totalQuantity: 1,
+      condition: "good",
+      image: "https://example.com/other.jpg",
+      rentalTerms: "Terms",
+      status: "approved",
+      featured: false,
+      inventoryVersion: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }
+    const equipResult = await db.collection("equipment").insertOne(otherEquipment)
+    const otherEquipmentId = equipResult.insertedId
+    
+    // Create JWT for other owner
+    const keyPair = await generateKeyPair("EdDSA")
+    const jwk = await exportJWK(keyPair.publicKey)
+    const kid = "test-key-" + Date.now()
+    await db.collection("jwks").insertOne({
+      _id: kid,
+      publicKey: JSON.stringify(jwk),
+      alg: "EdDSA",
+    })
+    
+    const otherOwnerJwt = await new SignJWT({
+      sub: "test-other-owner-1",
+      role: "owner",
+      roleVersion: 0,
+      profileImage: null,
+    })
+      .setProtectedHeader({ alg: "EdDSA", kid, typ: "JWT" })
+      .setIssuer(BETTER_AUTH_URL)
+      .setAudience(BETTER_AUTH_URL)
+      .setExpirationTime("1h")
+      .sign(keyPair.privateKey)
+    
+    // First owner tries to access other owner's equipment - should get 404
+    const { status } = await fetchJson(
+      `/api/equipment/${otherEquipmentId}`,
+      { headers: { Authorization: `Bearer ${global.__TEST_OWNER_JWT}` } }
+    )
+    assert(status === 404, `Owner should not access another owner's equipment, got ${status}`)
+    
+    // Cleanup
+    await db.collection("equipment").deleteOne({ _id: otherEquipmentId })
+    await db.collection("profiles").deleteOne({ _id: otherOwnerId })
+    await db.collection("jwks").deleteOne({ _id: kid })
+  }),
+
+  test("Admin can access all equipment statuses", async () => {
+    const pendingEquipment = global.__TEST_EQUIPMENT.find(e => e.status === "pending")
+    const rejectedEquipment = global.__TEST_EQUIPMENT.find(e => e.status === "rejected")
+    const approvedEquipment = global.__TEST_EQUIPMENT.find(e => e.status === "approved")
+    
+    assert(pendingEquipment && rejectedEquipment && approvedEquipment, "Should have all equipment statuses")
+    
+    for (const equipment of [pendingEquipment, rejectedEquipment, approvedEquipment]) {
+      const { status } = await fetchJson(
+        `/api/equipment/${equipment._id}`,
+        { headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` } }
+      )
+      assert(status === 200, `Admin should access ${equipment.status} equipment, got ${status}`)
+    }
   }),
 
   test("Existing auth/profile endpoints continue working", async () => {
@@ -2180,6 +2401,253 @@ const runTests = [
     const ownerProfile = await db.collection("profiles").findOne({ _id: ownerProfileId });
     assert(ownerProfile !== null, "Owner profile should still exist");
   }),
+
+  // ========== FAVORITES API TESTS ==========
+
+  test("Customer can add a favorite", async () => {
+    const approvedEquipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+
+    const { status, body } = await fetchJson("/api/favorites", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${global.__TEST_CUSTOMER_JWT}` },
+      body: JSON.stringify({ equipmentId: approvedEquipment._id.toString() }),
+    });
+
+    assert(status === 201, `Expected 201, got ${status}: ${JSON.stringify(body)}`);
+    assert(body.success === true, "Response should be successful");
+    assert(body.data.favorite, "Should have favorite object");
+    assert(body.data.favorite.equipmentId === approvedEquipment._id.toString(), "Should have correct equipmentId");
+    assert(body.data.favorite.userId, "Should have userId");
+    assert(body.data.favorite.id, "Should have favorite ID");
+  }),
+
+  test("Duplicate favorite is rejected", async () => {
+    const approvedEquipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+
+    // First add
+    await fetchJson("/api/favorites", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${global.__TEST_CUSTOMER_JWT}` },
+      body: JSON.stringify({ equipmentId: approvedEquipment._id.toString() }),
+    });
+
+    // Try to add again
+    const { status, body } = await fetchJson("/api/favorites", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${global.__TEST_CUSTOMER_JWT}` },
+      body: JSON.stringify({ equipmentId: approvedEquipment._id.toString() }),
+    });
+
+    assert(status === 409, `Expected 409, got ${status}: ${JSON.stringify(body)}`);
+    assert(body.success === false, "Response should be error");
+    assert(body.error.code === "DUPLICATE_FAVORITE", "Should have duplicate favorite error code");
+  }),
+
+  test("Customer can list their own favorites", async () => {
+    const approvedEquipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+
+    // Add a favorite first
+    await fetchJson("/api/favorites", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${global.__TEST_CUSTOMER_JWT}` },
+      body: JSON.stringify({ equipmentId: approvedEquipment._id.toString() }),
+    });
+
+    const { status, body } = await fetchJson("/api/favorites", {
+      headers: { Authorization: `Bearer ${global.__TEST_CUSTOMER_JWT}` },
+    });
+
+    assert(status === 200, `Expected 200, got ${status}: ${JSON.stringify(body)}`);
+    assert(body.success === true, "Response should be successful");
+    assert(body.data.favorites, "Should have favorites array");
+    assert(Array.isArray(body.data.favorites), "Favorites should be an array");
+    assert(body.data.favorites.length >= 1, "Should have at least one favorite");
+    assert(body.data.favorites.some((f) => f.equipmentId === approvedEquipment._id.toString()), "Should include the added favorite");
+    assert(body.data.pagination, "Should have pagination");
+  }),
+
+  test("Customer can remove their own favorite", async () => {
+    const approvedEquipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+
+    // Add a favorite first
+    const addResponse = await fetchJson("/api/favorites", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${global.__TEST_CUSTOMER_JWT}` },
+      body: JSON.stringify({ equipmentId: approvedEquipment._id.toString() }),
+    });
+    const favoriteId = addResponse.body.data.favorite.id;
+
+    // Remove the favorite
+    const { status, body } = await fetchJson(`/api/favorites/${favoriteId}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${global.__TEST_CUSTOMER_JWT}` },
+    });
+
+    assert(status === 200, `Expected 200, got ${status}: ${JSON.stringify(body)}`);
+    assert(body.success === true, "Response should be successful");
+    assert(body.data.deleted === true, "Should confirm deletion");
+    assert(body.data.id === favoriteId, "Should return deleted ID");
+
+    // Verify it's removed from list
+    const { status: listStatus, body: listBody } = await fetchJson("/api/favorites", {
+      headers: { Authorization: `Bearer ${global.__TEST_CUSTOMER_JWT}` },
+    });
+    assert(listStatus === 200);
+    assert(!listBody.data.favorites.some((f) => f.id === favoriteId), "Favorite should be removed from list");
+  }),
+
+  test("Customer cannot remove another Customer's favorite", async () => {
+    const approvedEquipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+
+    // Create another customer
+    const otherCustomerProfile = {
+      betterAuthUserId: "test-customer-2",
+      name: "Other Customer",
+      email: "customer2@example.com",
+      profileImage: null,
+      phone: null,
+      address: null,
+      role: "customer",
+      roleVersion: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    await db.collection("profiles").insertOne(otherCustomerProfile);
+    const otherCustomerProfileDoc = await db.collection("profiles").findOne({ betterAuthUserId: "test-customer-2" });
+
+    // Create JWT for other customer
+    const keyPair = await generateKeyPair("EdDSA");
+    const jwk = await exportJWK(keyPair.publicKey);
+    const kid = "test-key-" + Date.now();
+    await db.collection("jwks").insertOne({
+      _id: kid,
+      publicKey: JSON.stringify(jwk),
+      alg: "EdDSA",
+    });
+
+    const otherCustomerJwt = await new SignJWT({
+      sub: "test-customer-2",
+      role: "customer",
+      roleVersion: 0,
+      profileImage: null,
+    })
+      .setProtectedHeader({ alg: "EdDSA", kid, typ: "JWT" })
+      .setIssuer(BETTER_AUTH_URL)
+      .setAudience(BETTER_AUTH_URL)
+      .setExpirationTime("1h")
+      .sign(keyPair.privateKey);
+
+    // Other customer adds a favorite
+    const addResponse = await fetchJson("/api/favorites", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${otherCustomerJwt}` },
+      body: JSON.stringify({ equipmentId: approvedEquipment._id.toString() }),
+    });
+    const favoriteId = addResponse.body.data.favorite.id;
+
+    // First customer tries to remove other customer's favorite
+    const { status } = await fetchJson(`/api/favorites/${favoriteId}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${global.__TEST_CUSTOMER_JWT}` },
+    });
+
+    assert(status === 403, `Expected 403, got ${status}`);
+
+    // Cleanup
+    await db.collection("profiles").deleteOne({ _id: otherCustomerProfileDoc._id });
+    await db.collection("jwks").deleteOne({ _id: kid });
+  }),
+
+  test("Customer cannot favorite pending equipment", async () => {
+    const pendingEquipment = await createPendingEquipmentForFavorites(db, ownerProfileId);
+
+    const { status, body } = await fetchJson("/api/favorites", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${global.__TEST_CUSTOMER_JWT}` },
+      body: JSON.stringify({ equipmentId: pendingEquipment._id.toString() }),
+    });
+
+    assert(status === 400, `Expected 400, got ${status}: ${JSON.stringify(body)}`);
+    assert(body.success === false, "Response should be error");
+    assert(body.error.code === "INVALID_STATUS", "Should have invalid status error code");
+  }),
+
+  test("Customer cannot favorite rejected equipment", async () => {
+    const rejectedEquipment = await createRejectedEquipmentForFavorites(db, ownerProfileId);
+
+    const { status, body } = await fetchJson("/api/favorites", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${global.__TEST_CUSTOMER_JWT}` },
+      body: JSON.stringify({ equipmentId: rejectedEquipment._id.toString() }),
+    });
+
+    assert(status === 400, `Expected 400, got ${status}: ${JSON.stringify(body)}`);
+    assert(body.success === false, "Response should be error");
+    assert(body.error.code === "INVALID_STATUS", "Should have invalid status error code");
+  }),
+
+  test("Unauthenticated requests are rejected for favorites", async () => {
+    const approvedEquipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+
+    const { status } = await fetchJson("/api/favorites", {
+      method: "POST",
+      body: JSON.stringify({ equipmentId: approvedEquipment._id.toString() }),
+    });
+
+    assert(status === 401, `Expected 401, got ${status}`);
+  }),
+
+  test("Owner cannot use Customer Favorites APIs", async () => {
+    const approvedEquipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+
+    const { status } = await fetchJson("/api/favorites", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${global.__TEST_OWNER_JWT}` },
+      body: JSON.stringify({ equipmentId: approvedEquipment._id.toString() }),
+    });
+
+    assert(status === 403, `Expected 403, got ${status}`);
+  }),
+
+  test("Admin cannot use Customer Favorites APIs", async () => {
+    const approvedEquipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+
+    const { status } = await fetchJson("/api/favorites", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${global.__TEST_ADMIN_JWT}` },
+      body: JSON.stringify({ equipmentId: approvedEquipment._id.toString() }),
+    });
+
+    assert(status === 403, `Expected 403, got ${status}`);
+  }),
+
+  test("Equipment details includes isFavorited field for customers", async () => {
+    const approvedEquipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+
+    // First, check without favorite
+    const { status: status1, body: body1 } = await fetchJson(
+      `/api/equipment/${approvedEquipment._id}`,
+      { headers: { Authorization: `Bearer ${global.__TEST_CUSTOMER_JWT}` } }
+    );
+    assert(status1 === 200, `Expected 200, got ${status1}`);
+    assert(body1.data.equipment.isFavorited === false, "Should not be favorited initially");
+
+    // Add favorite
+    await fetchJson("/api/favorites", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${global.__TEST_CUSTOMER_JWT}` },
+      body: JSON.stringify({ equipmentId: approvedEquipment._id.toString() }),
+    });
+
+    // Check again
+    const { status: status2, body: body2 } = await fetchJson(
+      `/api/equipment/${approvedEquipment._id}`,
+      { headers: { Authorization: `Bearer ${global.__TEST_CUSTOMER_JWT}` } }
+    );
+    assert(status2 === 200, `Expected 200, got ${status2}`);
+    assert(body2.data.equipment.isFavorited === true, "Should be favorited after adding");
+  }),
+
 ];
 
 async function main() {

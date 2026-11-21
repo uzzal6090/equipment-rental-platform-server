@@ -10,7 +10,9 @@ import { profileRouter } from "./src/routes/profile.js";
 import { profileImageRouter } from "./src/routes/profileImage.js";
 import { equipmentRouter } from "./src/routes/equipment.js";
 import { equipmentImageRouter } from "./src/routes/equipmentImage.js";
+import { favoritesRouter } from "./src/routes/favorites.js";
 import { adminRouter } from "./src/routes/admin.js";
+import { ownerRouter } from "./src/routes/owner.js";
 
 const app = express();
 
@@ -61,7 +63,11 @@ app.use("/api/profile", profileRouter);
 
 app.use("/api/equipment", equipmentRouter);
 
+app.use("/api/favorites", favoritesRouter);
+
 app.use("/api/admin", adminRouter);
+
+app.use("/api/owner", ownerRouter);
 
     app.get("/", (req, res) => {
       res.status(200).json({

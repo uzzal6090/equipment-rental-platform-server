@@ -37,6 +37,9 @@ async function connectDB() {
     throw error;
   }
 
+  console.error("[connectDB] Using MONGODB_URI:", uri.substring(0, 50) + "...");
+  console.error("[connectDB] Using DB_NAME:", dbName);
+
   configureDNS();
 
   try {

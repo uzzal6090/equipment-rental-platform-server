@@ -57,7 +57,7 @@ router.get("/owner/me", verifyToken, verifyOwner, async (req, res) => {
 // GET /api/equipment/:id - Private equipment details (auth required)
 router.get("/:id", verifyToken, async (req, res) => {
   try {
-    const equipment = await getEquipmentDetails(req.params.id);
+    const equipment = await getEquipmentDetails(req.params.id, req.profile);
     if (!equipment) {
       return error(res, "Equipment not found", 404, "EQUIPMENT_NOT_FOUND");
     }

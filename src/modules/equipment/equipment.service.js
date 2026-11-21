@@ -297,7 +297,7 @@ async function getEquipmentById(id) {
   return db.collection(COLLECTIONS.EQUIPMENT).findOne({ _id: objectId });
 }
 
-async function getEquipmentDetails(id) {
+async function getEquipmentDetails(id, requesterProfile) {
   const db = getDB();
 
   let objectId;
@@ -310,7 +310,31 @@ async function getEquipmentDetails(id) {
   const equipment = await db.collection(COLLECTIONS.EQUIPMENT).findOne({ _id: objectId });
   if (!equipment) return null;
 
+  // Enforce access control based on requester's role and equipment status
+  const isAdmin = requesterProfile && requesterProfile.role === "admin";
+  const isOwner = requesterProfile && requesterProfile.role === "owner" && equipment.ownerId.equals(requesterProfile.profileId);
+  const isCustomer = requesterProfile && requesterProfile.role === "customer";
+
+  // Admins can view all equipment
+  // Owners can view ONLY their own equipment (any status)
+  // Customers can view ONLY approved equipment
+  if (isAdmin) {
+    // Admin can access all - allow
+  } else if (isOwner) {
+    // Owner can only access their own equipment
+    // Already checked via isOwner
+  } else if (isCustomer) {
+    // Customer can only view approved equipment
+    if (equipment.status !== "approved") {
+      return null;
+    }
+  } else {
+    // Unknown role - deny access
+    return null;
+  }
+
   let ownerInfo = null;
+  let isFavorited = false;
   try {
     const ownerProfile = await db
       .collection(COLLECTIONS.PROFILES)
@@ -321,8 +345,18 @@ async function getEquipmentDetails(id) {
         profileImage: ownerProfile.profileImage || null,
       };
     }
+
+    // Check if equipment is favorited by the current customer
+    if (isCustomer && requesterProfile?.profileId) {
+      const favorite = await db.collection(COLLECTIONS.FAVORITES).findOne({
+        userId: requesterProfile.profileId,
+        equipmentId: equipment._id,
+      });
+      isFavorited = !!favorite;
+    }
   } catch {
     ownerInfo = null;
+    isFavorited = false;
   }
 
   return {
@@ -339,6 +373,7 @@ async function getEquipmentDetails(id) {
     owner: ownerInfo,
     status: equipment.status,
     createdAt: equipment.createdAt,
+    isFavorited,
   };
 }
 

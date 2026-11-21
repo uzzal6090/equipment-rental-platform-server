@@ -3,6 +3,7 @@ import { verifyToken } from "../middleware/verifyToken.js";
 import { verifyAdmin } from "../middleware/verifyAdmin.js";
 import { success, error } from "../utils/response.js";
 import { listUsers, updateUserRole } from "../modules/admin/adminUsers.service.js";
+import { getAdminAnalytics } from "../modules/admin/adminAnalytics.service.js";
 import {
   listAllEquipment,
   approveEquipment,
@@ -12,6 +13,19 @@ import {
 } from "../modules/admin/adminEquipment.service.js";
 
 const router = express.Router();
+
+// Admin Analytics endpoints
+router.get("/analytics", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const analytics = await getAdminAnalytics();
+    return success(res, analytics);
+  } catch (err) {
+    if (err.statusCode) {
+      return error(res, err.message, err.statusCode, err.code);
+    }
+    return error(res, "Failed to fetch analytics", 500, "FETCH_FAILED");
+  }
+});
 
 // Admin Users endpoints
 router.get("/users", verifyToken, verifyAdmin, async (req, res) => {
