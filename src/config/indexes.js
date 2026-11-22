@@ -7,6 +7,7 @@ const COLLECTIONS = {
   REVIEWS: "reviews",
   EMAIL_OUTBOX: "emailOutbox",
   PROFILES: "profiles",
+  WEBHOOK_EVENTS: "webhookEvents",
 };
 
 async function createCollections(db) {
@@ -20,17 +21,18 @@ async function createCollections(db) {
 }
 
 // Correctness-critical indexes: unique constraints that underpin idempotency.
-// Failures on these are reported as migration-required conflicts; they are
-// never silently swallowed and never auto-dropped.
-const CRITICAL_UNIQUE_INDEXES = new Set([
-  "profiles.betterAuthUserId_1",
-  "bookings.checkoutIntent_1",
-  "bookings.stripeSessionId_1",
-  "payments.checkoutIntent_1",
-  "payments.stripeSessionId_1",
-  "favorites.userId_1_equipmentId_1",
-  "emailOutbox.bookingId_1_recipientType_1",
-]);
+  // Failures on these are reported as migration-required conflicts; they are
+  // never silently swallowed and never auto-dropped.
+  const CRITICAL_UNIQUE_INDEXES = new Set([
+    "profiles.betterAuthUserId_1",
+    "bookings.checkoutIntent_1",
+    "bookings.stripeSessionId_1",
+    "payments.checkoutIntent_1",
+    "payments.stripeSessionId_1",
+    "favorites.userId_1_equipmentId_1",
+    "emailOutbox.bookingId_1_recipientType_1",
+    "webhookEvents.eventId_1",
+  ]);
 
 async function safeCreateIndex(db, collectionName, keys, options = {}) {
   const indexName = Object.keys(keys)
@@ -108,6 +110,11 @@ async function createIndexes(db) {
   await safeCreateIndex(db, COLLECTIONS.EMAIL_OUTBOX, { bookingId: 1, recipientType: 1 }, { unique: true });
   await safeCreateIndex(db, COLLECTIONS.EMAIL_OUTBOX, { status: 1 });
   await safeCreateIndex(db, COLLECTIONS.EMAIL_OUTBOX, { createdAt: 1 });
+
+  // webhookEvents: idempotency tracking for Stripe webhooks
+  await safeCreateIndex(db, COLLECTIONS.WEBHOOK_EVENTS, { eventId: 1 }, { unique: true });
+  await safeCreateIndex(db, COLLECTIONS.WEBHOOK_EVENTS, { eventType: 1 });
+  await safeCreateIndex(db, COLLECTIONS.WEBHOOK_EVENTS, { processedAt: 1 });
 }
 
 async function ensureDatabase(db) {

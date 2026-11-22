@@ -5,7 +5,7 @@ import { MongoClient } from "mongodb";
 dotenvConfig();
 
 const uri = process.env.MONGODB_URI;
-const dbName = process.env.DB_NAME || "equipment_rental_db";
+const getDbName = () => process.env.DB_NAME || "equipment_rental_db";
 
 let client;
 let db;
@@ -38,16 +38,16 @@ async function connectDB() {
   }
 
   console.error("[connectDB] Using MONGODB_URI:", uri.substring(0, 50) + "...");
-  console.error("[connectDB] Using DB_NAME:", dbName);
+  console.error("[connectDB] Using DB_NAME:", getDbName());
 
   configureDNS();
 
   try {
     client = new MongoClient(uri);
     await client.connect();
-    db = client.db(dbName);
+    db = client.db(getDbName());
     isConnected = true;
-    console.log("Connected to MongoDB database:", dbName);
+    console.log("Connected to MongoDB database:", getDbName());
     return db;
   } catch (error) {
     isConnected = false;

@@ -3,6 +3,8 @@ import { COLLECTIONS } from "../config/indexes.js";
 
 const BOOKING_STATUS_CONFIRMED = "confirmed";
 const INTENT_STATUS_PENDING = "pending";
+const INTENT_STATUS_PROCESSING = "processing";
+const ACTIVE_INTENT_STATUSES = [INTENT_STATUS_PENDING, INTENT_STATUS_PROCESSING];
 const ERROR_INVENTORY_VERSION_CONFLICT = "INVENTORY_VERSION_CONFLICT";
 const ERROR_INSUFFICIENT_INVENTORY = "INSUFFICIENT_INVENTORY";
 
@@ -91,18 +93,22 @@ async function computeAvailability(db, equipmentId, startDate, endDate, session)
     )
     .toArray();
 
-  // Pending, unexpired checkout-intent aggregation runs after the confirmed
-  // aggregation completes, using the same session.
-  const pendingResult = await db
+  // Active checkout-intent aggregation runs after the confirmed aggregation.
+  // Both pending (unexpired) and processing intents reserve inventory.
+  // Processing intents must remain counted until a confirmed booking is
+  // atomically created or the intent is explicitly released/expired/failed.
+  const activeIntentResult = await db
     .collection(COLLECTIONS.CHECKOUT_INTENTS)
     .aggregate(
       [
         {
           $match: {
             equipmentId,
-            status: INTENT_STATUS_PENDING,
-            expiresAt: { $gt: new Date() },
             ...overlap,
+            $or: [
+              { status: INTENT_STATUS_PENDING, expiresAt: { $gt: new Date() } },
+              { status: INTENT_STATUS_PROCESSING },
+            ],
           },
         },
         { $group: { _id: null, qty: { $sum: "$quantity" } } },
@@ -112,7 +118,7 @@ async function computeAvailability(db, equipmentId, startDate, endDate, session)
     .toArray();
 
   const confirmedQty = confirmedResult[0] ? confirmedResult[0].qty : 0;
-  const pendingQty = pendingResult[0] ? pendingResult[0].qty : 0;
+  const pendingQty = activeIntentResult[0] ? activeIntentResult[0].qty : 0;
 
   return {
     available: totalQuantity - confirmedQty - pendingQty,
