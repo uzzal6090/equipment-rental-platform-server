@@ -5,6 +5,9 @@ export function validateEnv() {
     "BETTER_AUTH_URL",
     "BETTER_AUTH_SECRET",
     "CLIENT_URL",
+    "STRIPE_SECRET_KEY",
+    "STRIPE_WEBHOOK_SECRET",
+    "IMGBB_API_KEY",
   ];
   const missing = required.filter((key) => !process.env[key]);
   if (missing.length > 0) {

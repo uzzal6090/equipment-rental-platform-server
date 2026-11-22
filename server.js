@@ -12,13 +12,19 @@ import { equipmentRouter } from "./src/routes/equipment.js";
 import { equipmentImageRouter } from "./src/routes/equipmentImage.js";
 import { favoritesRouter } from "./src/routes/favorites.js";
 import { rentalsRouter } from "./src/routes/rentals.js";
+import { bookingsRouter } from "./src/routes/bookings.js";
 import { ownerRentalsRouter } from "./src/routes/ownerRentals.js";
 import { adminRouter } from "./src/routes/admin.js";
 import { ownerRouter } from "./src/routes/owner.js";
+import { webhooksRouter } from "./src/routes/webhooks.js";
 
 const app = express();
 
 const clientUrl = process.env.CLIENT_URL || "http://localhost:3000";
+
+if (process.env.NODE_ENV === "production" && !process.env.CLIENT_URL) {
+  throw new Error("Missing required environment variable: CLIENT_URL. Set CLIENT_URL to your production frontend URL.");
+}
 
 app.use(
   cors({
@@ -59,7 +65,11 @@ async function startServer() {
     // Mount the equipment image router BEFORE the global express.json() parser for the same reason.
     app.use("/api/equipment/image", equipmentImageRouter);
 
-    app.use(express.json());
+    // Mount webhook router BEFORE express.json() so Stripe signature verification
+// receives the raw request body.
+app.use("/api/webhooks", webhooksRouter);
+
+app.use(express.json());
 
 app.use("/api/profile", profileRouter);
 
@@ -68,6 +78,8 @@ app.use("/api/equipment", equipmentRouter);
 app.use("/api/favorites", favoritesRouter);
 
 app.use("/api/rentals", rentalsRouter);
+
+app.use("/api/bookings", bookingsRouter);
 
 app.use("/api/owner/rentals", ownerRentalsRouter);
 
