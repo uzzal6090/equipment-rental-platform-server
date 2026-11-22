@@ -3,6 +3,10 @@ import * as dns from "dns";
 import { MongoClient, ObjectId } from "mongodb";
 import { spawn } from "child_process";
 import { generateKeyPair, exportJWK, SignJWT } from "jose";
+import { handleStripeWebhook } from "../src/modules/equipment/stripe.service.js";
+import { reserveCheckoutIntent, releaseIntentReservation } from "../src/modules/equipment/booking.service.js";
+import { checkAvailability, createCheckoutIntent } from "../src/modules/equipment/booking.service.js";
+import { connectDB as connectAppDB, closeDB as closeAppDB, getClient } from "../src/config/db.js";
 
 // Load test environment (.env.test takes precedence)
 dotenvConfig({ path: ".env.test", override: true });
@@ -78,12 +82,14 @@ let customerJwt;
 let adminJwt;
 
 async function connectTestDb() {
-  mongoClient = new MongoClient(MONGODB_URI);
-  await mongoClient.connect();
-  db = mongoClient.db(DB_NAME);
+  process.env.DB_NAME = DB_NAME;
+  db = await connectAppDB();
+  mongoClient = getClient();
   console.log(`Connected to test database: ${DB_NAME}`);
+  // Ensure server process and app DB use same test DB
+  process.env.MONGODB_URI = MONGODB_URI;
+  process.env.DB_NAME = DB_NAME;
 }
-
 async function insertFixtures() {
   // Clean up first
   await db.collection("profiles").deleteMany({});
@@ -2346,7 +2352,299 @@ const runTests = [
     assert(typeof rental.equipment.rentalPrice === "number", "Should have equipment rentalPrice");
   }),
 
+  // ========== ACCEPTANCE TESTS FOR PHASE 4.1 FIXES ==========
+  test("Processing intent remains counted until booking is created (inventory gap race)", async () => {
+    const equipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+    await db.collection("equipment").updateOne({ _id: equipment._id }, { $set: { totalQuantity: 1 } });
+    const intent = await reserveCheckoutIntent(db, equipment._id.toString(), customerProfileId.toString(), ownerProfileId.toString(), "2027-02-01", "2027-02-03", 1, null, null, null, 100);
+    // Simulate payment reported: intent moves to processing before booking creation.
+    await db.collection("checkoutIntents").updateOne({ _id: intent._id, status: "pending" }, { $set: { status: "processing", updatedAt: new Date() } });
+    let failed = false;
+    try {
+      await reserveCheckoutIntent(db, equipment._id.toString(), customerProfileId.toString(), ownerProfileId.toString(), "2027-02-01", "2027-02-03", 1, null, null, null, 100);
+    } catch (e) {
+      failed = e.code === "INSUFFICIENT_INVENTORY" || e.statusCode === 409;
+    }
+    assert(failed, "Overlapping reservation must be rejected while intent is processing");
+    // Complete payment: booking created atomically, intent becomes completed.
+    const event = { id: `evt_gap_${Date.now()}`, type: "checkout.session.completed", data: { object: { id: `cs_gap_${Date.now()}`, payment_status: "paid", amount_total: 10000, currency: "usd", payment_intent: `pi_gap_${Date.now()}`, metadata: { checkout_intent_id: intent._id.toString(), user_id: customerProfileId.toString(), equipment_id: equipment._id.toString(), owner_id: ownerProfileId.toString() } } } };
+    const result = await handleStripeWebhook(db, event);
+    assert(["booking_created","already_processed"].includes(result.status), `Expected booking creation, got ${result.status}`);
+    const bookings = await db.collection("bookings").find({ checkoutIntent: intent._id }).toArray();
+    assert(bookings.length === 1, "Exactly one booking should exist");
+  }),
+
+  test("Cancellation racing with successful payment does not create inconsistent state", async () => {
+    const equipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+    await db.collection("equipment").updateOne({ _id: equipment._id }, { $set: { totalQuantity: 1 } });
+    const intent = await reserveCheckoutIntent(db, equipment._id.toString(), customerProfileId.toString(), ownerProfileId.toString(), "2027-01-11", "2027-01-13", 1, null, null, null, 100);
+    const event = { id: `evt_race_pay_${Date.now()}`, type: "checkout.session.completed", data: { object: { id: `cs_race_pay_${Date.now()}`, payment_status: "paid", amount_total: 10000, currency: "usd", payment_intent: `pi_race_pay_${Date.now()}`, metadata: { checkout_intent_id: intent._id.toString(), user_id: customerProfileId.toString(), equipment_id: equipment._id.toString(), owner_id: ownerProfileId.toString() } } } };
+    await Promise.all([
+      releaseIntentReservation(db, intent._id, "cancelled").catch(() => null),
+      handleStripeWebhook(db, event).catch(() => null),
+    ]);
+    const bookings = await db.collection("bookings").find({ checkoutIntent: intent._id }).toArray();
+    const finalIntent = await db.collection("checkoutIntents").findOne({ _id: intent._id });
+    assert(bookings.length <= 1, `Expected at most one booking, got ${bookings.length}`);
+    if (bookings.length === 1) {
+      assert(finalIntent.status === "completed", `Completed booking requires completed intent, got ${finalIntent.status}`);
+    } else {
+      assert(["cancelled","expired","pending"].includes(finalIntent.status), `No booking means intent not completed, got ${finalIntent.status}`);
+    }
+  }),
+
+
+  test("Concurrent reservation: two customers cannot oversell the last available unit", async () => {
+    const equipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+    await db.collection("equipment").updateOne({ _id: equipment._id }, { $set: { totalQuantity: 1 } });
+    const startDate = new Date("2026-12-01");
+    const endDate = new Date("2026-12-07");
+    const [r1, r2] = await Promise.allSettled([
+      reserveCheckoutIntent(db, equipment._id.toString(), customerProfileId.toString(), ownerProfileId.toString(), startDate, endDate, 1, "+1-555-0100", "123 Test St", "Concurrency", 100),
+      reserveCheckoutIntent(db, equipment._id.toString(), customerProfileId.toString(), ownerProfileId.toString(), startDate, endDate, 1, "+1-555-0100", "123 Test St", "Concurrency", 100),
+    ]);
+    const fulfilled = [r1, r2].filter((r) => r.status === "fulfilled");
+    const rejected = [r1, r2].filter((r) => r.status === "rejected");
+    assert(fulfilled.length === 1, `Expected exactly one success, got ${fulfilled.length}`);
+    assert(rejected.length === 1, `Expected exactly one failure, got ${rejected.length}`);
+    const intents = await db.collection("checkoutIntents").find({ equipmentId: equipment._id, status: "pending" }).toArray();
+    assert(intents.length === 1, `Expected exactly one pending checkout intent, got ${intents.length}`);
+  }),
+
+  test("Non-overlapping dates can both be reserved successfully", async () => {
+    const equipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+    await db.collection("equipment").updateOne({ _id: equipment._id }, { $set: { totalQuantity: 1 } });
+    const a = await reserveCheckoutIntent(db, equipment._id.toString(), customerProfileId.toString(), ownerProfileId.toString(), "2026-12-01", "2026-12-03", 1, null, null, null, 100);
+    const b = await reserveCheckoutIntent(db, equipment._id.toString(), customerProfileId.toString(), ownerProfileId.toString(), "2026-12-04", "2026-12-06", 1, null, null, null, 100);
+    assert(a._id && b._id, "Both non-overlapping reservations should succeed");
+  }),
+
+  test("Quantity greater than one is supported for overlapping reservations", async () => {
+    const equipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+    await db.collection("equipment").updateOne({ _id: equipment._id }, { $set: { totalQuantity: 3 } });
+    const a = await reserveCheckoutIntent(db, equipment._id.toString(), customerProfileId.toString(), ownerProfileId.toString(), "2026-12-10", "2026-12-12", 2, null, null, null, 200);
+    const b = await reserveCheckoutIntent(db, equipment._id.toString(), customerProfileId.toString(), ownerProfileId.toString(), "2026-12-10", "2026-12-12", 1, null, null, null, 100);
+    assert(a._id && b._id, "Reservations within total quantity should succeed");
+  }),
+
+  test("Partial available quantity rejects over-request", async () => {
+    const equipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+    await db.collection("equipment").updateOne({ _id: equipment._id }, { $set: { totalQuantity: 3 } });
+    await reserveCheckoutIntent(db, equipment._id.toString(), customerProfileId.toString(), ownerProfileId.toString(), "2026-12-15", "2026-12-17", 2, null, null, null, 200);
+    let failed = false;
+    try {
+      await reserveCheckoutIntent(db, equipment._id.toString(), customerProfileId.toString(), ownerProfileId.toString(), "2026-12-15", "2026-12-17", 2, null, null, null, 200);
+    } catch (e) {
+      failed = e.code === "INSUFFICIENT_INVENTORY" || e.statusCode === 409;
+    }
+    assert(failed, "Over-request against partial availability should fail");
+  }),
+
+  test("Cancellation releases reservation exactly once and restores availability", async () => {
+    const equipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+    await db.collection("equipment").updateOne({ _id: equipment._id }, { $set: { totalQuantity: 1 } });
+    const intent = await reserveCheckoutIntent(db, equipment._id.toString(), customerProfileId.toString(), ownerProfileId.toString(), "2026-12-20", "2026-12-22", 1, null, null, null, 100);
+    const first = await releaseIntentReservation(db, intent._id, "cancelled");
+    const second = await releaseIntentReservation(db, intent._id, "cancelled");
+    assert(first.released === true, "First cancellation should release");
+    assert(second.released === false, "Second cancellation must not double-release");
+    const again = await reserveCheckoutIntent(db, equipment._id.toString(), customerProfileId.toString(), ownerProfileId.toString(), "2026-12-20", "2026-12-22", 1, null, null, null, 100);
+    assert(again._id, "Availability should be restored after single release");
+  }),
+
+  test("Expiration releases reservation exactly once and restores availability", async () => {
+    const equipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+    await db.collection("equipment").updateOne({ _id: equipment._id }, { $set: { totalQuantity: 1 } });
+    const intent = await reserveCheckoutIntent(db, equipment._id.toString(), customerProfileId.toString(), ownerProfileId.toString(), "2026-12-23", "2026-12-25", 1, null, null, null, 100);
+    await db.collection("checkoutIntents").updateOne({ _id: intent._id }, { $set: { expiresAt: new Date(Date.now() - 1000) } });
+    const first = await releaseIntentReservation(db, intent._id, "expired");
+    const second = await releaseIntentReservation(db, intent._id, "expired");
+    assert(first.released === true, "First expiration should release");
+    assert(second.released === false, "Second expiration must not double-release");
+    const again = await reserveCheckoutIntent(db, equipment._id.toString(), customerProfileId.toString(), ownerProfileId.toString(), "2026-12-23", "2026-12-25", 1, null, null, null, 100);
+    assert(again._id, "Availability should be restored after expiration");
+  }),
+
+  test("Stripe session creation failure releases reservation", async () => {
+    const equipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+    await db.collection("equipment").updateOne({ _id: equipment._id }, { $set: { totalQuantity: 1 } });
+    const intent = await reserveCheckoutIntent(db, equipment._id.toString(), customerProfileId.toString(), ownerProfileId.toString(), "2026-12-26", "2026-12-28", 1, null, null, null, 100);
+    // Simulate route failure after reservation but before confirmed payment.
+    const released = await releaseIntentReservation(db, intent._id, "expired");
+    assert(released.released === true, "Reservation should be released on Stripe session failure");
+    const again = await reserveCheckoutIntent(db, equipment._id.toString(), customerProfileId.toString(), ownerProfileId.toString(), "2026-12-26", "2026-12-28", 1, null, null, null, 100);
+    assert(again._id, "Inventory should be restored after Stripe session creation failure");
+  }),
+
+  test("Webhook concurrency: duplicate event delivery is handled idempotently", async () => {
+    const equipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+    await db.collection("equipment").updateOne({ _id: equipment._id }, { $set: { totalQuantity: 1 } });
+    const intent = await reserveCheckoutIntent(db, equipment._id.toString(), customerProfileId.toString(), ownerProfileId.toString(), "2026-12-29", "2026-12-31", 1, null, null, null, 100);
+    const event = { id: `evt_dup_${Date.now()}`, type: "checkout.session.completed", data: { object: { id: `cs_dup_${Date.now()}`, payment_status: "paid", amount_total: 10000, currency: "usd", payment_intent: `pi_dup_${Date.now()}`, metadata: { checkout_intent_id: intent._id.toString(), user_id: customerProfileId.toString(), equipment_id: equipment._id.toString(), owner_id: ownerProfileId.toString() } } } };
+    await Promise.all([handleStripeWebhook(db, event), handleStripeWebhook(db, event)]);
+    const bookings = await db.collection("bookings").find({ checkoutIntent: intent._id }).toArray();
+    const payments = await db.collection("payments").find({ checkoutIntent: intent._id }).toArray();
+    assert(bookings.length === 1, `Expected one booking, got ${bookings.length}`);
+    assert(payments.length <= 1, `Expected at most one payment, got ${payments.length}`);
+  }),
+
+  test("Webhook idempotency: duplicate event after server restart is ignored", async () => {
+    const eventId = `evt_restart_${Date.now()}`;
+    await db.collection("webhookEvents").insertOne({ eventId, eventType: "checkout.session.completed", status: "completed", processedAt: new Date(), result: { received: true }, createdAt: new Date(), updatedAt: new Date() });
+    const event = { id: eventId, type: "checkout.session.completed", data: { object: { id: "cs_restart", metadata: {} } } };
+    const result = await handleStripeWebhook(db, event);
+    assert(result.received === true, "Replayed event should be handled safely");
+  }),
+
+  test("Different event IDs for same Checkout Session do not create duplicate booking/payment", async () => {
+    const equipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+    await db.collection("equipment").updateOne({ _id: equipment._id }, { $set: { totalQuantity: 1 } });
+    const intent = await reserveCheckoutIntent(db, equipment._id.toString(), customerProfileId.toString(), ownerProfileId.toString(), "2027-01-02", "2027-01-04", 1, null, null, null, 100);
+    const sessionObj = { id: `cs_same_${Date.now()}`, payment_status: "paid", amount_total: 10000, currency: "usd", payment_intent: `pi_same_${Date.now()}`, metadata: { checkout_intent_id: intent._id.toString(), user_id: customerProfileId.toString(), equipment_id: equipment._id.toString(), owner_id: ownerProfileId.toString() } };
+    await handleStripeWebhook(db, { id: `evt_same_a_${Date.now()}`, type: "checkout.session.completed", data: { object: sessionObj } });
+    await handleStripeWebhook(db, { id: `evt_same_b_${Date.now()}`, type: "checkout.session.completed", data: { object: sessionObj } });
+    const bookings = await db.collection("bookings").find({ checkoutIntent: intent._id }).toArray();
+    const payments = await db.collection("payments").find({ stripeSessionId: sessionObj.id }).toArray();
+    assert(bookings.length === 1, `Expected one booking, got ${bookings.length}`);
+    assert(payments.length === 1, `Expected one payment, got ${payments.length}`);
+  }),
+
+  test("Webhook process restart recovers unfinished event after stale lease", async () => {
+    const equipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+    await db.collection("equipment").updateOne({ _id: equipment._id }, { $set: { totalQuantity: 1 } });
+    const intent = await reserveCheckoutIntent(db, equipment._id.toString(), customerProfileId.toString(), ownerProfileId.toString(), "2027-01-05", "2027-01-07", 1, null, null, null, 100);
+    const eventId = `evt_stale_${Date.now()}`;
+    await db.collection("webhookEvents").insertOne({ eventId, eventType: "checkout.session.completed", status: "processing", leaseUntil: new Date(Date.now() - 1000), attempts: 1, createdAt: new Date(), updatedAt: new Date() });
+    const event = { id: eventId, type: "checkout.session.completed", data: { object: { id: `cs_stale_${Date.now()}`, payment_status: "paid", amount_total: 10000, currency: "usd", payment_intent: `pi_stale_${Date.now()}`, metadata: { checkout_intent_id: intent._id.toString(), user_id: customerProfileId.toString(), equipment_id: equipment._id.toString(), owner_id: ownerProfileId.toString() } } } };
+    const result = await handleStripeWebhook(db, event);
+    assert(["booking_created","already_processed"].includes(result.status), `Expected recovered processing, got ${result.status}`);
+    const bookings = await db.collection("bookings").find({ checkoutIntent: intent._id }).toArray();
+    assert(bookings.length === 1, `Expected one booking after recovery, got ${bookings.length}`);
+  }),
+
+  test("Webhook partial failure: failed DB write followed by safe retry recovers", async () => {
+    const equipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+    await db.collection("equipment").updateOne({ _id: equipment._id }, { $set: { totalQuantity: 1 } });
+    const intent = await reserveCheckoutIntent(db, equipment._id.toString(), customerProfileId.toString(), ownerProfileId.toString(), "2027-01-08", "2027-01-10", 1, null, null, null, 100);
+    const sessionObj = { id: `cs_retry_${Date.now()}`, payment_status: "paid", amount_total: 10000, currency: "usd", payment_intent: `pi_retry_${Date.now()}`, metadata: { checkout_intent_id: intent._id.toString(), user_id: customerProfileId.toString(), equipment_id: equipment._id.toString(), owner_id: ownerProfileId.toString() } };
+    const paymentsColl = db.collection("payments");
+    const origInsertOne = paymentsColl.insertOne.bind(paymentsColl);
+    let injected = false;
+    paymentsColl.insertOne = async (...args) => { if (!injected) { injected = true; throw new Error("Injected payment failure"); } return origInsertOne(...args); };
+    let first;
+    try { first = await handleStripeWebhook(db, { id: `evt_retry_${Date.now()}`, type: "checkout.session.completed", data: { object: sessionObj } }); } finally { paymentsColl.insertOne = origInsertOne; }
+    assert(first.status === "transaction_failed" || first.status === "booking_created", `Expected transaction_failed or booking_created, got ${first.status}`);
+    const second = await handleStripeWebhook(db, { id: `evt_retry2_${Date.now()}`, type: "checkout.session.completed", data: { object: sessionObj } });
+    assert(["booking_created","already_processed","transaction_failed"].includes(second.status), `Expected handled retry, got ${second.status}`);
+    const bookings = await db.collection("bookings").find({ checkoutIntent: intent._id }).toArray();
+    const payments = await db.collection("payments").find({ stripeSessionId: sessionObj.id }).toArray();
+    assert(bookings.length === 1, `Expected exactly one booking after retry, got ${bookings.length}`);
+    assert(payments.length <= 1, `Expected at most one payment after retry, got ${payments.length}`);
+  }),
+
+  test("Cancellation race: customer cancels while payment is processing", async () => {
+    const equipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+    const intent = await createCheckoutIntentForTest(db, customerProfileId, equipment._id, ownerProfileId, 100);
+    await db.collection("checkoutIntents").updateOne({ _id: intent._id, status: "pending" }, { $set: { status: "cancelled", released: true, updatedAt: new Date() } });
+    const event = { id: `evt_cancel_race_${Date.now()}`, type: "checkout.session.completed", data: { object: { id: `cs_cancel_race_${Date.now()}`, payment_status: "paid", amount_total: 10000, currency: "usd", payment_intent: `pi_cancel_race_${Date.now()}`, metadata: { checkout_intent_id: intent._id.toString(), user_id: customerProfileId.toString(), equipment_id: equipment._id.toString(), owner_id: ownerProfileId.toString() } } } };
+    const webhookResult = await handleStripeWebhook(db, event);
+    assert(webhookResult.status !== "booking_created", "Webhook must not create booking for cancelled intent");
+    const bookings = await db.collection("bookings").find({ checkoutIntent: intent._id }).toArray();
+    assert(bookings.length === 0, "No booking should be created for cancelled intent");
+  }),
+
+  test("Cancellation race: checkout.session.completed races with customer cancellation", async () => {
+    const equipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+    const intent = await createCheckoutIntentForTest(db, customerProfileId, equipment._id, ownerProfileId, 100);
+    const event = { id: `evt_race_${Date.now()}`, type: "checkout.session.completed", data: { object: { id: `cs_race_${Date.now()}`, payment_status: "paid", amount_total: 10000, currency: "usd", payment_intent: `pi_race_${Date.now()}`, metadata: { checkout_intent_id: intent._id.toString(), user_id: customerProfileId.toString(), equipment_id: equipment._id.toString(), owner_id: ownerProfileId.toString() } } } };
+    await Promise.all([
+      db.collection("checkoutIntents").findOneAndUpdate({ _id: intent._id, status: "pending" }, { $set: { status: "cancelled", released: true, updatedAt: new Date() } }, { returnDocument: "after" }),
+      handleStripeWebhook(db, event),
+    ]);
+    const bookings = await db.collection("bookings").find({ checkoutIntent: intent._id }).toArray();
+    assert(bookings.length <= 1, `Expected at most one booking, got ${bookings.length}`);
+  }),
+
+  test("Payment validation: amount mismatch rejects booking creation", async () => {
+    const equipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+    const intent = await createCheckoutIntentForTest(db, customerProfileId, equipment._id, ownerProfileId, 100);
+    const event = { id: "evt_amount_mismatch", type: "checkout.session.completed", data: { object: { id: "cs_test_amount_mismatch", payment_status: "paid", amount_total: 5000, currency: "usd", payment_intent: "pi_test", metadata: { checkout_intent_id: intent._id.toString(), user_id: customerProfileId.toString(), equipment_id: equipment._id.toString() } } } };
+    const result = await handleStripeWebhook(db, event);
+    assert(result.status === "amount_mismatch", `Expected amount_mismatch, got ${result.status}`);
+    const intentAfter = await db.collection("checkoutIntents").findOne({ _id: intent._id });
+    assert(intentAfter.status === "pending", "Intent should be reverted to pending");
+  }),
+
+  test("Payment validation: currency mismatch rejects booking creation", async () => {
+    const equipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+    const intent = await createCheckoutIntentForTest(db, customerProfileId, equipment._id, ownerProfileId, 100);
+    const event = { id: "evt_currency_mismatch", type: "checkout.session.completed", data: { object: { id: "cs_test_currency_mismatch", payment_status: "paid", amount_total: 10000, currency: "eur", payment_intent: "pi_test", metadata: { checkout_intent_id: intent._id.toString(), user_id: customerProfileId.toString(), equipment_id: equipment._id.toString() } } } };
+    const result = await handleStripeWebhook(db, event);
+    assert(result.status === "currency_mismatch", `Expected currency_mismatch, got ${result.status}`);
+  }),
+
+  test("Payment validation: metadata mismatch rejects booking", async () => {
+    const equipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+    const intent = await createCheckoutIntentForTest(db, customerProfileId, equipment._id, ownerProfileId, 100);
+    const event = { id: "evt_meta_mismatch", type: "checkout.session.completed", data: { object: { id: "cs_test_metadata_mismatch", payment_status: "paid", amount_total: 10000, currency: "usd", payment_intent: "pi_test", metadata: { checkout_intent_id: intent._id.toString(), user_id: new ObjectId().toString(), equipment_id: equipment._id.toString() } } } };
+    const result = await handleStripeWebhook(db, event);
+    assert(result.status === "metadata_mismatch", `Expected metadata_mismatch, got ${result.status}`);
+  }),
+
+  test("Payment validation: wrong equipment ID rejects booking", async () => {
+    const equipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+    const otherEquipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+    const intent = await createCheckoutIntentForTest(db, customerProfileId, equipment._id, ownerProfileId, 100);
+    const event = { id: "evt_wrong_equipment", type: "checkout.session.completed", data: { object: { id: "cs_test_wrong_equipment", payment_status: "paid", amount_total: 10000, currency: "usd", payment_intent: "pi_test", metadata: { checkout_intent_id: intent._id.toString(), user_id: customerProfileId.toString(), equipment_id: otherEquipment._id.toString() } } } };
+    const result = await handleStripeWebhook(db, event);
+    assert(result.status === "metadata_mismatch", `Expected metadata_mismatch, got ${result.status}`);
+  }),
+
+  test("Payment validation: expired intent rejects booking", async () => {
+    const equipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+    const intent = await createCheckoutIntentForTest(db, customerProfileId, equipment._id, ownerProfileId, 100);
+    await db.collection("checkoutIntents").updateOne({ _id: intent._id }, { $set: { expiresAt: new Date(Date.now() - 1000) } });
+    const event = { id: "evt_expired", type: "checkout.session.completed", data: { object: { id: "cs_test_expired", payment_status: "paid", amount_total: 10000, currency: "usd", payment_intent: "pi_test", metadata: { checkout_intent_id: intent._id.toString(), user_id: customerProfileId.toString(), equipment_id: equipment._id.toString() } } } };
+    const result = await handleStripeWebhook(db, event);
+    assert(result.status === "intent_expired", `Expected intent_expired, got ${result.status}`);
+  }),
+
+  test("Payment validation: unpaid session does not create booking", async () => {
+    const equipment = await createApprovedEquipmentForFavorites(db, ownerProfileId);
+    const intent = await createCheckoutIntentForTest(db, customerProfileId, equipment._id, ownerProfileId, 100);
+    const event = { id: "evt_unpaid", type: "checkout.session.completed", data: { object: { id: "cs_test_unpaid", payment_status: "unpaid", amount_total: 10000, currency: "usd", payment_intent: "pi_test", metadata: { checkout_intent_id: intent._id.toString(), user_id: customerProfileId.toString(), equipment_id: equipment._id.toString() } } } };
+    const result = await handleStripeWebhook(db, event);
+    assert(result.status === "payment_not_completed", `Expected payment_not_completed, got ${result.status}`);
+    const intentAfter = await db.collection("checkoutIntents").findOne({ _id: intent._id });
+    assert(intentAfter.status === "pending", "Intent should be reverted to pending");
+  }),
+
 ];
+
+async function createCheckoutIntentForTest(db, customerId, equipmentId, ownerId, totalPrice) {
+  const intent = {
+    equipmentId: new ObjectId(equipmentId),
+    userId: new ObjectId(customerId),
+    ownerId: new ObjectId(ownerId),
+    startDate: new Date("2026-12-01"),
+    endDate: new Date("2026-12-07"),
+    quantity: 1,
+    contactPhone: "+1-555-0100",
+    deliveryAddress: "123 Test St",
+    notes: "Test booking",
+    totalPrice,
+    currency: "usd",
+    stripeSessionId: null,
+    status: "pending",
+    expiresAt: new Date(Date.now() + 30 * 60 * 1000),
+    released: false,
+    inventoryVersionSeen: 0,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  };
+  const result = await db.collection("checkoutIntents").insertOne(intent);
+  return { ...intent, _id: result.insertedId };
+}
 
 async function fetchJson(path, options = {}) {
   const headers = {
@@ -2443,6 +2741,7 @@ async function main() {
       serverProc.kill();
     }
     await cleanupFixtures();
+    await closeAppDB().catch(() => {});
     if (mongoClient) {
       await mongoClient.close();
     }
