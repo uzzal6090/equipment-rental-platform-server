@@ -38,34 +38,98 @@ const PORT = process.env.PORT || 5000;
 let server;
 let isShuttingDown = false;
 
-async function startServer() {
-  try {
+// ---------------------------------------------------------------------------
+// Shared, lazily-initialized database connection.
+// ---------------------------------------------------------------------------
+// A single Promise (not a boolean-only lock) is cached so concurrent requests
+// share one connection attempt instead of opening duplicate MongoDB connections
+// within one instance. On failure the cached Promise is cleared so a later
+// request can retry.
+let dbInitPromise = null;
+
+async function initDatabase() {
+  if (dbInitPromise) {
+    return dbInitPromise;
+  }
+
+  const init = (async () => {
     validateEnv();
     await connectDB();
     const db = getDB();
     const transactionsSupported = await verifyTransactionSupport();
-    console.log("MongoDB transactions supported:", transactionsSupported);
     if (!transactionsSupported) {
       throw new Error("MongoDB transaction support is required but unavailable; refusing to start");
     }
     await ensureDatabase(db);
     console.log("Database collections and indexes ensured");
+    return db;
+  })();
 
-    const { authHandler: createdAuthHandler } = await createAuth(db, getClient());
+  dbInitPromise = init;
+  init.catch((error) => {
+    if (dbInitPromise === init) {
+      dbInitPromise = null;
+    }
+  });
 
-    // Mount Better Auth handler BEFORE express.json() per Better Auth Express v5 requirements.
-    app.use("/api/auth/{*any}", createdAuthHandler);
+  return init;
+}
 
-    // Mount the profile image router BEFORE the global express.json() parser so its
-    // route-specific (larger) body limit applies. Otherwise the global default-limit
-    // JSON parser rejects base64 image uploads (~6.6MB for a 5MB image) with 413
-    // before the request ever reaches the upload handler.
-    app.use("/api/profile/image", profileImageRouter);
+// Lazily creates the Better Auth handler once the database is ready.
+let authHandler = null;
+let authHandlerPromise = null;
 
-    // Mount the equipment image router BEFORE the global express.json() parser for the same reason.
-    app.use("/api/equipment/image", equipmentImageRouter);
+async function getAuthHandler() {
+  if (authHandler) {
+    return authHandler;
+  }
+  if (!authHandlerPromise) {
+    authHandlerPromise = (async () => {
+      const db = await initDatabase();
+      const { authHandler: createdAuthHandler } = await createAuth(db, getClient());
+      return createdAuthHandler;
+    })();
+    authHandlerPromise.catch(() => {
+      authHandlerPromise = null;
+    });
+  }
+  authHandler = await authHandlerPromise;
+  return authHandler;
+}
 
-    // Mount webhook router BEFORE express.json() so Stripe signature verification
+// Ensure the database is initialized before any route handler runs. This keeps
+// database-dependent routes working on Vercel (lazy init) while remaining a
+// no-op after local startup has already initialized the database (shared
+// cached Promise, so no double initialization).
+app.use(async (req, res, next) => {
+  try {
+    await initDatabase();
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Mount Better Auth handler BEFORE express.json() per Better Auth Express v5 requirements.
+app.use("/api/auth/{*any}", async (req, res, next) => {
+  try {
+    const handler = await getAuthHandler();
+    return handler(req, res, next);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Mount the profile image router BEFORE the global express.json() parser so its
+// route-specific (larger) body limit applies. Otherwise the global default-limit
+// JSON parser rejects base64 image uploads (~6.6MB for a 5MB image) with 413
+// before the request ever reaches the upload handler.
+app.use("/api/profile/image", profileImageRouter);
+
+// Mount the equipment image router BEFORE the global express.json() parser for the same reason.
+app.use("/api/equipment/image", equipmentImageRouter);
+
+// Mount webhook router BEFORE express.json() so Stripe signature verification
 // receives the raw request body.
 app.use("/api/webhooks", webhooksRouter);
 
@@ -87,23 +151,27 @@ app.use("/api/admin", adminRouter);
 
 app.use("/api/owner", ownerRouter);
 
-    app.get("/", (req, res) => {
-      res.status(200).json({
-        success: true,
-        message: "Equipment Rental Platform API is running!",
-      });
-    });
+app.get("/", (req, res) => {
+  res.status(200).json({
+    success: true,
+    message: "Equipment Rental Platform API is running!",
+  });
+});
 
-    // 404 handler (must be after all routes)
-    app.use((req, res) => {
-      res.status(404).json({
-        success: false,
-        error: { message: "Not found", code: "NOT_FOUND" },
-      });
-    });
+// 404 handler (must be after all routes)
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    error: { message: "Not found", code: "NOT_FOUND" },
+  });
+});
 
-    // Error handler (must be last)
-    app.use(errorHandler);
+// Error handler (must be last)
+app.use(errorHandler);
+
+async function startServer() {
+  try {
+    await initDatabase();
 
     server = app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
@@ -180,6 +248,11 @@ app.use("/api/owner", ownerRouter);
   }
 }
 
-startServer();
+// startServer() (and therefore app.listen()) only runs locally. Vercel consumes
+// the default export directly and never calls startServer() or app.listen().
+if (process.env.VERCEL !== "1") {
+  startServer();
+}
 
+export default app;
 export { app };
