@@ -14,6 +14,7 @@ import { favoritesRouter } from "./src/routes/favorites.js";
 import { rentalsRouter } from "./src/routes/rentals.js";
 import { bookingsRouter } from "./src/routes/bookings.js";
 import { ownerRentalsRouter } from "./src/routes/ownerRentals.js";
+import { adminRentalsRouter } from "./src/routes/adminRentals.js";
 import { adminRouter } from "./src/routes/admin.js";
 import { ownerRouter } from "./src/routes/owner.js";
 import { webhooksRouter } from "./src/routes/webhooks.js";
@@ -75,43 +76,12 @@ async function initDatabase() {
   return init;
 }
 
-// Lazily creates the Better Auth handler once the database is ready.
-let authHandler = null;
-let authHandlerPromise = null;
+// Mount express.json() BEFORE Better Auth handler to parse JSON bodies.
+// The webhook and image upload routes that need raw body are mounted before this.
+app.use(express.json());
 
-async function getAuthHandler() {
-  if (authHandler) {
-    return authHandler;
-  }
-  if (!authHandlerPromise) {
-    authHandlerPromise = (async () => {
-      const db = await initDatabase();
-      const { authHandler: createdAuthHandler } = await createAuth(db, getClient());
-      return createdAuthHandler;
-    })();
-    authHandlerPromise.catch(() => {
-      authHandlerPromise = null;
-    });
-  }
-  authHandler = await authHandlerPromise;
-  return authHandler;
-}
-
-// Ensure the database is initialized before any route handler runs. This keeps
-// database-dependent routes working on Vercel (lazy init) while remaining a
-// no-op after local startup has already initialized the database (shared
-// cached Promise, so no double initialization).
-app.use(async (req, res, next) => {
-  try {
-    await initDatabase();
-    next();
-  } catch (error) {
-    next(error);
-  }
-});
-
-// Mount Better Auth handler BEFORE express.json() per Better Auth Express v5 requirements.
-app.use("/api/auth/{*any}", async (req, res, next) => {
+// Mount Better Auth handler
+app.use("/api/auth", async (req, res, next) => {
   try {
     const handler = await getAuthHandler();
     return handler(req, res, next);
@@ -133,8 +103,6 @@ app.use("/api/equipment/image", equipmentImageRouter);
 // receives the raw request body.
 app.use("/api/webhooks", webhooksRouter);
 
-app.use(express.json());
-
 app.use("/api/profile", profileRouter);
 
 app.use("/api/equipment", equipmentRouter);
@@ -146,6 +114,8 @@ app.use("/api/rentals", rentalsRouter);
 app.use("/api/bookings", bookingsRouter);
 
 app.use("/api/owner/rentals", ownerRentalsRouter);
+
+app.use("/api/admin/rentals", adminRentalsRouter);
 
 app.use("/api/admin", adminRouter);
 
@@ -246,6 +216,28 @@ async function startServer() {
     }
     process.exit(1);
   }
+}
+
+// Lazily creates the Better Auth handler once the database is ready.
+let authHandler = null;
+let authHandlerPromise = null;
+
+async function getAuthHandler() {
+  if (authHandler) {
+    return authHandler;
+  }
+  if (!authHandlerPromise) {
+    authHandlerPromise = (async () => {
+      const db = await initDatabase();
+      const { authHandler: createdAuthHandler } = await createAuth(db, getClient());
+      return createdAuthHandler;
+    })();
+    authHandlerPromise.catch(() => {
+      authHandlerPromise = null;
+    });
+  }
+  authHandler = await authHandlerPromise;
+  return authHandler;
 }
 
 // startServer() (and therefore app.listen()) only runs locally. Vercel consumes

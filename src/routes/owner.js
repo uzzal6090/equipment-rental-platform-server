@@ -10,7 +10,7 @@ const router = express.Router();
 router.get("/analytics", verifyToken, verifyOwner, async (req, res) => {
   try {
     // Get owner ID from the authenticated user's profile
-    const ownerId = req.user.profileId;
+    const ownerId = req.profile.profileId.toString();
     const analytics = await getOwnerAnalytics(ownerId);
     return success(res, analytics);
   } catch (err) {

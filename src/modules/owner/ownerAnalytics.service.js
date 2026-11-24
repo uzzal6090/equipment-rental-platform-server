@@ -26,11 +26,103 @@ async function getOwnerAnalytics(ownerId) {
     }
   });
 
-  // For analytics that depend on bookings/payments (not implemented yet)
-  // Return 0 with a note that booking/payment functionality is not yet implemented
-  const completedRentals = 0;
-  const totalEarnings = 0;
+  // Completed Rentals - count bookings with bookingStatus: "completed" for this owner
+  const completedRentals = await db.collection(COLLECTIONS.BOOKINGS).countDocuments({
+    ownerId: ownerObjectId,
+    bookingStatus: "completed",
+  });
+
+  // Total Earnings - sum of paid payments for this owner's bookings
+  const earningsResult = await db.collection(COLLECTIONS.PAYMENTS).aggregate([
+    { $match: { status: "paid" } },
+    {
+      $lookup: {
+        from: COLLECTIONS.BOOKINGS,
+        localField: "bookingId",
+        foreignField: "_id",
+        as: "booking",
+      },
+    },
+    { $unwind: "$booking" },
+    { $match: { "booking.ownerId": ownerObjectId } },
+    { $group: { _id: null, total: { $sum: "$amount" } } },
+  ]).toArray();
+  const totalEarnings = earningsResult.length > 0 ? earningsResult[0].total : 0;
+
+  // Monthly Earnings Statistics (last 12 months)
+  const twelveMonthsAgo = new Date();
+  twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 11);
+  twelveMonthsAgo.setDate(1);
+  twelveMonthsAgo.setHours(0, 0, 0, 0);
+
+  const monthlyEarningsAgg = await db.collection(COLLECTIONS.PAYMENTS).aggregate([
+    {
+      $match: {
+        status: "paid",
+        createdAt: { $gte: twelveMonthsAgo },
+      },
+    },
+    {
+      $lookup: {
+        from: COLLECTIONS.BOOKINGS,
+        localField: "bookingId",
+        foreignField: "_id",
+        as: "booking",
+      },
+    },
+    { $unwind: "$booking" },
+    { $match: { "booking.ownerId": ownerObjectId } },
+    {
+      $group: {
+        _id: {
+          year: { $year: "$createdAt" },
+          month: { $month: "$createdAt" },
+        },
+        earnings: { $sum: "$amount" },
+      },
+    },
+    {
+      $sort: { "_id.year": 1, "_id.month": 1 },
+    },
+    {
+      $project: {
+        _id: 0,
+        month: {
+          $concat: [
+            { $toString: "$_id.year" },
+            "-",
+            {
+              $cond: {
+                if: { $lt: ["$_id.month", 10] },
+                then: { $concat: ["0", { $toString: "$_id.month" }] },
+                else: { $toString: "$_id.month" },
+              },
+            },
+          ],
+        },
+        earnings: 1,
+      },
+    },
+  ]).toArray();
+
+  // Generate all 12 months (including months with 0 earnings)
   const monthlyEarnings = [];
+  for (let i = 11; i >= 0; i--) {
+    const date = new Date();
+    date.setMonth(date.getMonth() - i);
+    date.setDate(1);
+    date.setHours(0, 0, 0, 0);
+
+    const year = date.getFullYear();
+    const month = date.getMonth() + 1;
+    const monthKey = `${year}-${String(month).padStart(2, "0")}`;
+
+    const existing = monthlyEarningsAgg.find((item) => item.month === monthKey);
+    monthlyEarnings.push({
+      month: monthKey,
+      earnings: existing ? existing.earnings : 0,
+    });
+  }
 
   return {
     totalListedEquipment: totalEquipment,
@@ -38,11 +130,7 @@ async function getOwnerAnalytics(ownerId) {
     completedRentals,
     totalEarnings,
     monthlyEarnings,
-    notes: {
-      completedRentals: "Booking functionality not yet implemented",
-      totalEarnings: "Payment functionality not yet implemented",
-      monthlyEarnings: "Payment functionality not yet implemented",
-    },
+    notes: {},
   };
 }
 

@@ -1,25 +1,20 @@
 import { betterAuth } from "better-auth";
 import { mongodbAdapter } from "@better-auth/mongo-adapter";
 import { toNodeHandler } from "better-auth/node";
-import { google } from "better-auth/social-providers";
 import { jwt } from "better-auth/plugins/jwt";
 import { ObjectId } from "mongodb";
 import { hashPassword as defaultHashPassword } from "@better-auth/utils/password";
 import { APIError, BASE_ERROR_CODES } from "@better-auth/core/error";
 
-const socialProviders = {};
-if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
-  socialProviders.google = {
-    clientId: process.env.GOOGLE_CLIENT_ID,
-    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-  };
-} else {
-  console.warn(
-    "Google OAuth credentials not configured. GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are required for Google sign-in."
-  );
-}
-
 export async function createAuth(db, client) {
+  const socialProviders = {};
+  if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
+    socialProviders.google = {
+      clientId: process.env.GOOGLE_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    };
+  }
+
   const auth = betterAuth({
     database: mongodbAdapter(db, { client }),
     secret: process.env.BETTER_AUTH_SECRET,
