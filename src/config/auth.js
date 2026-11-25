@@ -77,6 +77,12 @@ export async function createAuth(db, client) {
       updateAge: 60 * 60 * 24,
     },
     useSecureCookies: process.env.NODE_ENV === "production",
+    advanced: {
+      defaultCookieAttributes: {
+        sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+        secure: process.env.NODE_ENV === "production",
+      },
+    },
     databaseHooks: {
       user: {
         create: {
