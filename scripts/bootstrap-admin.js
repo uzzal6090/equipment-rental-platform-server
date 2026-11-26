@@ -28,6 +28,12 @@ const ALLOWED_ROLES = ["customer", "owner", "admin"];
 const TARGET_ROLE = "admin";
 const SOURCE_ROLE = "customer";
 
+// Production configuration constants - hardcoded for safety
+const PRODUCTION_DB_NAME = "equipment_rental_db";
+const PRODUCTION_BETTER_AUTH_URL = "https://server-uzzal6090.vercel.app";
+const PRODUCTION_CLIENT_URL = "https://equipment-rental-platform-client-zeta.vercel.app";
+const PRODUCTION_MONGODB_HOSTNAME = "cluster0.qpry6ut.mongodb.net";
+
 class BootstrapAdmin {
   constructor() {
     this.uri = process.env.MONGODB_URI;
@@ -116,6 +122,114 @@ class BootstrapAdmin {
     return { user, profile };
   }
 
+  validateProductionConfig() {
+    console.log("\n🔒 Validating Production configuration...");
+
+    // 1. Hard-block test database
+    if (this.dbName === "equipment_rental_test_db") {
+      throw new Error(
+        "BLOCKED: Test database 'equipment_rental_test_db' detected. " +
+        "This script refuses to run against the test database. " +
+        "Set DB_NAME=equipment_rental_db for Production."
+      );
+    }
+
+    // 2. Require exact Production database name
+    if (this.dbName !== PRODUCTION_DB_NAME) {
+      throw new Error(
+        `BLOCKED: Invalid database name. Expected '${PRODUCTION_DB_NAME}', got '${this.dbName}'. ` +
+        "Set DB_NAME=equipment_rental_db for Production."
+      );
+    }
+
+    // 3. Require explicit DB_NAME environment variable (not default)
+    if (!process.env.DB_NAME) {
+      throw new Error(
+        "BLOCKED: DB_NAME environment variable must be explicitly set for Production. " +
+        "Set DB_NAME=equipment_rental_db."
+      );
+    }
+
+    // 4. Validate BETTER_AUTH_URL matches Production
+    const betterAuthUrl = process.env.BETTER_AUTH_URL;
+    if (!betterAuthUrl) {
+      throw new Error(
+        "BLOCKED: BETTER_AUTH_URL environment variable is required for Production. " +
+        "Expected: " + PRODUCTION_BETTER_AUTH_URL
+      );
+    }
+
+    if (betterAuthUrl !== PRODUCTION_BETTER_AUTH_URL) {
+      throw new Error(
+        `BLOCKED: BETTER_AUTH_URL does not match Production. ` +
+        `Expected: ${PRODUCTION_BETTER_AUTH_URL}, Got: ${betterAuthUrl}`
+      );
+    }
+
+    // 5. Validate CLIENT_URL matches exact Production frontend URL
+    const clientUrl = process.env.CLIENT_URL;
+    if (!clientUrl) {
+      throw new Error(
+        "BLOCKED: CLIENT_URL environment variable is required for Production. " +
+        "Expected: " + PRODUCTION_CLIENT_URL
+      );
+    }
+
+    if (clientUrl !== PRODUCTION_CLIENT_URL) {
+      throw new Error(
+        `BLOCKED: CLIENT_URL does not match Production. ` +
+        `Expected: ${PRODUCTION_CLIENT_URL}, Got: ${clientUrl}`
+      );
+    }
+
+    // 6. Validate NODE_ENV is production
+    const nodeEnv = process.env.NODE_ENV;
+    if (!nodeEnv) {
+      throw new Error(
+        "BLOCKED: NODE_ENV environment variable is required for Production. " +
+        "Expected: production"
+      );
+    }
+
+    if (nodeEnv !== "production") {
+      throw new Error(
+        `BLOCKED: NODE_ENV must be 'production' for Production. ` +
+        `Expected: production, Got: ${nodeEnv}`
+      );
+    }
+
+    // 7. Validate MongoDB cluster hostname
+    const mongodbUri = process.env.MONGODB_URI;
+    if (!mongodbUri) {
+      throw new Error(
+        "BLOCKED: MONGODB_URI environment variable is required for Production."
+      );
+    }
+
+    let parsedUri;
+    try {
+      parsedUri = new URL(mongodbUri);
+    } catch {
+      throw new Error(
+        "BLOCKED: MONGODB_URI is not a valid URL."
+      );
+    }
+
+    if (parsedUri.hostname !== PRODUCTION_MONGODB_HOSTNAME) {
+      throw new Error(
+        `BLOCKED: MONGODB_URI hostname does not match Production. ` +
+        `Expected: ${PRODUCTION_MONGODB_HOSTNAME}, Got: ${parsedUri.hostname}`
+      );
+    }
+
+    console.log("✅ Production configuration validated:");
+    console.log("   Database:", this.dbName);
+    console.log("   BETTER_AUTH_URL:", betterAuthUrl);
+    console.log("   CLIENT_URL:", clientUrl);
+    console.log("   NODE_ENV:", nodeEnv);
+    console.log("   MONGODB_HOSTNAME:", parsedUri.hostname);
+  }
+
   async promote(email, dryRun = false) {
     console.log("\n🚀 Admin Bootstrap Process");
     console.log("=".repeat(50));
@@ -148,7 +262,10 @@ class BootstrapAdmin {
       throw new Error(`Only Customer accounts can be promoted via bootstrap. Current role: ${profile.role}`);
     }
 
-    // Step 3: Confirmation
+    // Step 3: Validate Production configuration BEFORE confirmation
+    this.validateProductionConfig();
+
+    // Step 4: Confirmation
     if (!dryRun) {
       console.log("\n⚠️  This will permanently change the account role from 'customer' to 'admin'.");
       console.log("   Role version will be incremented from", profile.roleVersion, "to", profile.roleVersion + 1);
@@ -165,7 +282,7 @@ class BootstrapAdmin {
       }
     }
 
-    // Step 4: Perform atomic update
+    // Step 5: Perform atomic update
     console.log("\n🔄 Updating profile...");
 
     const result = await this.db.collection("profiles").findOneAndUpdate(
