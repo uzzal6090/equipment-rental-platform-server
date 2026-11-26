@@ -6,26 +6,24 @@ import { connectDB, closeDB, getDB, getClient, verifyTransactionSupport } from "
 import { ensureDatabase } from "./src/config/indexes.js";
 import { createAuth } from "./src/config/auth.js";
 import { errorHandler } from "./src/middleware/errorHandler.js";
-import { profileRouter } from "./src/routes/profile.js";
-import { profileImageRouter } from "./src/routes/profileImage.js";
-import { equipmentRouter } from "./src/routes/equipment.js";
-import { equipmentImageRouter } from "./src/routes/equipmentImage.js";
-import { favoritesRouter } from "./src/routes/favorites.js";
-import { rentalsRouter } from "./src/routes/rentals.js";
-import { bookingsRouter } from "./src/routes/bookings.js";
-import { ownerRentalsRouter } from "./src/routes/ownerRentals.js";
-import { adminRentalsRouter } from "./src/routes/adminRentals.js";
-import { adminRouter } from "./src/routes/admin.js";
-import { ownerRouter } from "./src/routes/owner.js";
-import { webhooksRouter } from "./src/routes/webhooks.js";
+
+// Route modules
+import equipmentRoutes from "./src/modules/equipment/equipment.routes.js";
+import usersRoutes from "./src/modules/users/users.routes.js";
+import favoritesRoutes from "./src/modules/favorites/favorites.routes.js";
+import reviewsRoutes from "./src/modules/reviews/reviews.routes.js";
+import bookingsRoutes from "./src/modules/bookings/bookings.routes.js";
+import paymentsRoutes from "./src/modules/payments/payments.routes.js";
+import analyticsRoutes from "./src/modules/analytics/analytics.routes.js";
+import { handleStripeWebhook } from "./src/modules/payments/payments.controller.js";
+
+// Cron jobs
+import { startBookingStatusUpdater } from "./src/jobs/bookingStatusUpdater.js";
+import { startEmailProcessor } from "./src/jobs/emailProcessor.js";
 
 const app = express();
 
 const clientUrl = process.env.CLIENT_URL || "http://localhost:3000";
-
-if (process.env.NODE_ENV === "production" && !process.env.CLIENT_URL) {
-  throw new Error("Missing required environment variable: CLIENT_URL. Set CLIENT_URL to your production frontend URL.");
-}
 
 app.use(
   cors({
@@ -39,212 +37,113 @@ const PORT = process.env.PORT || 5000;
 let server;
 let isShuttingDown = false;
 
-// ---------------------------------------------------------------------------
-// Shared, lazily-initialized database connection.
-// ---------------------------------------------------------------------------
-// A single Promise (not a boolean-only lock) is cached so concurrent requests
-// share one connection attempt instead of opening duplicate MongoDB connections
-// within one instance. On failure the cached Promise is cleared so a later
-// request can retry.
-let dbInitPromise = null;
-
-async function initDatabase() {
-  if (dbInitPromise) {
-    return dbInitPromise;
-  }
-
-  const init = (async () => {
+async function startServer() {
+  try {
     validateEnv();
     await connectDB();
     const db = getDB();
     const transactionsSupported = await verifyTransactionSupport();
+    console.log("MongoDB transactions supported:", transactionsSupported);
     if (!transactionsSupported) {
       throw new Error("MongoDB transaction support is required but unavailable; refusing to start");
     }
     await ensureDatabase(db);
     console.log("Database collections and indexes ensured");
-    return db;
-  })();
 
-  dbInitPromise = init;
-  init.catch((error) => {
-    if (dbInitPromise === init) {
-      dbInitPromise = null;
+    const { authHandler: createdAuthHandler } = await createAuth(db, getClient());
+
+    // Mount Better Auth BEFORE express.json() per Better Auth Express v5 requirements
+    app.use("/api/auth/{*any}", createdAuthHandler);
+
+    // Stripe webhook needs raw body — mount BEFORE express.json()
+    if (process.env.STRIPE_SECRET_KEY && process.env.STRIPE_WEBHOOK_SECRET) {
+      app.post(
+        "/api/stripe/webhook",
+        express.raw({ type: "application/json" }),
+        handleStripeWebhook
+      );
     }
-  });
 
-  return init;
-}
+    app.use(express.json());
 
-// Mount express.json() BEFORE Better Auth handler to parse JSON bodies.
-// The webhook and image upload routes that need raw body are mounted before this.
-app.use(express.json());
+    // Health check
+    app.get("/", (req, res) => {
+      res.status(200).json({
+        success: true,
+        message: "Equipment Rental Platform API is running!",
+      });
+    });
 
-// Mount Better Auth handler
-app.use("/api/auth", async (req, res, next) => {
-  try {
-    const handler = await getAuthHandler();
-    return handler(req, res, next);
-  } catch (error) {
-    next(error);
-  }
-});
+    // API routes
+    app.use("/api/equipment", equipmentRoutes);
+    app.use("/api", usersRoutes);
+    app.use("/api/favorites", favoritesRoutes);
+    app.use("/api/reviews", reviewsRoutes);
+    app.use("/api/bookings", bookingsRoutes);
+    app.use("/api/payments", paymentsRoutes);
+    app.use("/api/analytics", analyticsRoutes);
 
-// Mount the profile image router BEFORE the global express.json() parser so its
-// route-specific (larger) body limit applies. Otherwise the global default-limit
-// JSON parser rejects base64 image uploads (~6.6MB for a 5MB image) with 413
-// before the request ever reaches the upload handler.
-app.use("/api/profile/image", profileImageRouter);
+    // 404 handler
+    app.use((req, res) => {
+      res.status(404).json({
+        success: false,
+        error: { message: "Not found", code: "NOT_FOUND" },
+      });
+    });
 
-// Mount the equipment image router BEFORE the global express.json() parser for the same reason.
-app.use("/api/equipment/image", equipmentImageRouter);
-
-// Mount webhook router BEFORE express.json() so Stripe signature verification
-// receives the raw request body.
-app.use("/api/webhooks", webhooksRouter);
-
-app.use("/api/profile", profileRouter);
-
-app.use("/api/equipment", equipmentRouter);
-
-app.use("/api/favorites", favoritesRouter);
-
-app.use("/api/rentals", rentalsRouter);
-
-app.use("/api/bookings", bookingsRouter);
-
-app.use("/api/owner/rentals", ownerRentalsRouter);
-
-app.use("/api/admin/rentals", adminRentalsRouter);
-
-app.use("/api/admin", adminRouter);
-
-app.use("/api/owner", ownerRouter);
-
-app.get("/", (req, res) => {
-  res.status(200).json({
-    success: true,
-    message: "Equipment Rental Platform API is running!",
-  });
-});
-
-// 404 handler (must be after all routes)
-app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    error: { message: "Not found", code: "NOT_FOUND" },
-  });
-});
-
-// Error handler (must be last)
-app.use(errorHandler);
-
-async function startServer() {
-  try {
-    await initDatabase();
+    // Error handler (must be last)
+    app.use(errorHandler);
 
     server = app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
     });
 
-    const gracefulShutdown = async (signal) => {
-      if (isShuttingDown) {
-        return;
-      }
-      isShuttingDown = true;
+    // Start cron jobs after server is up
+    startBookingStatusUpdater();
+    startEmailProcessor();
 
+    const gracefulShutdown = async (signal) => {
+      if (isShuttingDown) return;
+      isShuttingDown = true;
       console.log(`Received ${signal}. Shutting down gracefully...`);
 
-      // Force-exit safety net: only created when shutdown actually begins.
-      let forceExitTimer;
-      forceExitTimer = setTimeout(() => {
+      let forceExitTimer = setTimeout(() => {
         console.error("Graceful shutdown did not complete in time; forcing exit");
         process.exit(1);
       }, 15000);
-      if (forceExitTimer.unref) {
-        forceExitTimer.unref();
-      }
+      if (forceExitTimer.unref) forceExitTimer.unref();
 
       try {
-        // 1. Stop accepting new HTTP connections.
         if (server) {
-          try {
-            await new Promise((resolve, reject) => {
-              server.close((error) => {
-                if (error) {
-                  reject(error);
-                } else {
-                  resolve();
-                }
-              });
-            });
-            console.log("HTTP server closed");
-          } catch (error) {
-            console.error("Error closing HTTP server:", error.message);
-            throw error;
-          }
+          await new Promise((resolve, reject) => {
+            server.close((err) => (err ? reject(err) : resolve()));
+          });
+          console.log("HTTP server closed");
         }
-
-        // 2. Only then close MongoDB connections.
-        try {
-          await closeDB();
-          console.log("Database connection closed");
-        } catch (error) {
-          console.error("Error closing database:", error.message);
-          throw error;
-        }
-
+        await closeDB();
+        console.log("Database connection closed");
         clearTimeout(forceExitTimer);
         process.exit(0);
-      } catch (error) {
+      } catch (err) {
         clearTimeout(forceExitTimer);
-        console.error("Graceful shutdown failed:", error.message);
+        console.error("Graceful shutdown failed:", err.message);
         process.exit(1);
       }
     };
 
     process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
     process.on("SIGINT", () => gracefulShutdown("SIGINT"));
-  } catch (error) {
-    console.error("Failed to start server:", error.message);
-    // Close the database connection if it was initialized before exiting.
+  } catch (err) {
+    console.error("Failed to start server:", err.message);
     try {
       await closeDB();
-    } catch (closeError) {
-      // Do not mask the original startup error.
-      console.error("Error closing database after startup failure:", closeError.message);
+    } catch (closeErr) {
+      console.error("Error closing database after startup failure:", closeErr.message);
     }
     process.exit(1);
   }
 }
 
-// Lazily creates the Better Auth handler once the database is ready.
-let authHandler = null;
-let authHandlerPromise = null;
+startServer();
 
-async function getAuthHandler() {
-  if (authHandler) {
-    return authHandler;
-  }
-  if (!authHandlerPromise) {
-    authHandlerPromise = (async () => {
-      const db = await initDatabase();
-      const { authHandler: createdAuthHandler } = await createAuth(db, getClient());
-      return createdAuthHandler;
-    })();
-    authHandlerPromise.catch(() => {
-      authHandlerPromise = null;
-    });
-  }
-  authHandler = await authHandlerPromise;
-  return authHandler;
-}
-
-// startServer() (and therefore app.listen()) only runs locally. Vercel consumes
-// the default export directly and never calls startServer() or app.listen().
-if (process.env.VERCEL !== "1") {
-  startServer();
-}
-
-export default app;
 export { app };
